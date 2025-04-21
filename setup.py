@@ -14,13 +14,29 @@ def make_cuda_ext(name, module, sources):
 
 if __name__ == '__main__':
     setup(
-        name='UniTraj',
+        name='bevtp',
         version=1.0,
-        description='A Unified Framework for Scalable Vehicle Trajectory Prediction',
-        author='Lan Feng',
-        author_email='fenglan18@outlook.com',
-        license='Apache License 2.0',
-        packages=find_packages(exclude=['tools', 'data', 'output']),
+        description='bevtp',
+        author='Minsang Kong',
+        author_email='gms0725@kookmin.ac.kr',
+        license='MIT',
+        packages=find_packages(
+            exclude=[
+                'tools',
+                'data',
+                'build',
+                'ckpt',
+                'docs',
+                'experiment',
+                'lightning_logs',
+                'outputs',
+                'pretraining_ckpt',
+                'wandb',
+                'tmp',
+                '.vscode',
+                '*.egg-info'
+            ]
+        ),
         cmdclass={
             'build_ext': BuildExtension,
         },
