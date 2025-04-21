@@ -1,0 +1,8 @@
+BEVTP Decoder 수정 (DAB_DETR이 아니라 DAB_Deformable_DETR 식으로 수정)
+(BEVTP 디버깅하면서 ㄱㄱ)
+
+1. (decoder.py - Decoder) query_pos와 pos_scale 파라미터 shared
+2. (decoder.py - DecoderLayer) forward로 query_pos 받기
+3. (deform_attn2d.py) decoder_deform_attn.py 로 수정?
+4. (deform_attn2d.py) DAB_DETR에서는 con과 pos를 더함. BDA에서도 그럼. decoder에서는 concat해도 되나?
+5. (deform_attn2d.py) to_pos_k는 어떻게 하지??
