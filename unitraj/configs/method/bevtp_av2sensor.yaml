@@ -1,6 +1,6 @@
 # experiment_name (for wandb)
 
-exp_name: 'bevtp_av2sensor'
+exp_name: &exp_name 'bevtp_av2sensor'
 
 # train
 
@@ -29,6 +29,7 @@ map_class_names: &map_class_names
 
 MODEL:
     NAME: *model_name
+    exp_name: *exp_name
     past_len: *past_len
 
     PRE_ENCODER:
