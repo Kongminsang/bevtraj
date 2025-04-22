@@ -129,14 +129,13 @@ class BEVDeformableAggregation(nn.Module):
     def forward(self, bev_feat):
         
         B = bev_feat.shape[0]
-        output, ref_pos = map(lambda x: x[None].repeat(B, 1, 1), [self.ba_query, self.ref_pos])
-        ref_pos = torch.tanh(ref_pos)
+        output, raw_ref_pos = map(lambda x: x[None].repeat(B, 1, 1), [self.ba_query, self.ref_pos])
+        ref_pos = torch.tanh(raw_ref_pos)
         
         for lid, layer in enumerate(self.bda_layers):
             query_sine_embed = gen_sineembed_for_position(ref_pos, hidden_dim=self.D, temperature=20)
             query_pos = self.pos_scale(output) * self.query_pos(query_sine_embed)
             
-            # ref_pos = ref_pos.detach() # ablation study needed
             output = layer(output, query_pos, ref_pos, bev_feat)
             
             tmp = self.ref_pos_refine[lid](output)
