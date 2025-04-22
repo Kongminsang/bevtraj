@@ -6,9 +6,9 @@ devices: [ 0 ] # gpu ids
 eval: False
 
 # official evaluation
-nuscenes_dataroot: '/mnt/nas3_rcp_enac_u0900_vita_scratch/datasets/Prediction-Dataset/nuscenes/nuscenes_root'
+nuscenes_dataroot: 'data/nuscenes'
 eval_nuscenes: False # whether to evaluate with nuscenes evaluation tool
 eval_waymo: False # whether to evaluate with waymo evaluation tool
 
 defaults:
-  - method: BEVTP_nusc
+  - method: bevtp_nusc
