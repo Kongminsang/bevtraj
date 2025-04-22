@@ -4,4 +4,5 @@ hydra-core
 scikit-learn
 einops
 easydict
+pyarrow
 panda3d-simplepbr==0.10
