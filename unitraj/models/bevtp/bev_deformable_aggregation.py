@@ -100,8 +100,6 @@ class BEVDeformableAggregation(nn.Module):
         self.grid_size = config['grid_size']
         
         self.ba_query = nn.Parameter(torch.zeros(self.num_ba_query, self.D), requires_grad=True)
-        # self.ref_pos = nn.Parameter(torch.empty(self.num_ba_query, 2), requires_grad=True)
-        # nn.init.xavier_uniform_(self.ref_pos)
         self.ref_pos = nn.Parameter(self.create_uniform_2d_grid_tensor(self.num_ba_query), requires_grad=True)
         
         self.pos_scale = build_mlp(self.D, self.D, self.D, dropout=self.dropout)
@@ -115,6 +113,10 @@ class BEVDeformableAggregation(nn.Module):
         ref_pos_refine = MLP(self.D, self.D, 2, 3)
         self.ref_pos_refine = _get_clones(ref_pos_refine, self.config['num_bda_layers'])
         
+        new_grid_size = config['grid_size'].copy()
+        new_grid_size[1] *= -1  # Align with Unitaj coordinate system
+        self.register_buffer('denorm_scale', torch.tensor(new_grid_size, dtype=torch.float32))
+        
     def create_uniform_2d_grid_tensor(self, n_points):
         side = int(n_points ** 0.5)
         if side ** 2 != n_points:
@@ -122,9 +124,9 @@ class BEVDeformableAggregation(nn.Module):
 
         x = torch.linspace(-1, 1, side)
         y = torch.linspace(-1, 1, side)
-        yy, xx = torch.meshgrid(y, x, indexing='ij')  # 'ij' to preserve (y,x) order
-        grid = torch.stack([xx, yy], dim=-1)  # shape: (side, side, 2)
-        return grid.reshape(-1, 2)            # shape: (n_points, 2)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        grid = torch.stack([xx, yy], dim=-1)
+        return grid.reshape(-1, 2)
         
     def forward(self, bev_feat):
         
@@ -141,8 +143,7 @@ class BEVDeformableAggregation(nn.Module):
             tmp = self.ref_pos_refine[lid](output)
             ref_pos = torch.tanh(tmp + inverse_tanh(ref_pos))
             
-        ref_pos[..., 0] = ref_pos[..., 0] * self.grid_size[0]
-        ref_pos[..., 1] = ref_pos[..., 1] * self.grid_size[1]
+        ref_pos = ref_pos * self.denorm_scale[None, None, :]
         
         return output, ref_pos
         
