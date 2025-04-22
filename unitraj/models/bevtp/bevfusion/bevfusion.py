@@ -395,7 +395,7 @@ class BEVFusion(Base3DDetector):
         
         # hack implementation for handling different lidar coords
         if self.dataset_name == 'argo2':
-            x = torch.rot90(x, k=1, dims=(2,3))
+            feats = torch.rot90(feats, k=1, dims=(2,3))
         
         if self.bev_map_segmentation:
             seg_loss = self.heads['map'].loss(feats, batch_data_samples)
