@@ -389,7 +389,7 @@ class BaseDataset(Dataset):
             (obj_trajs_data, obj_trajs_mask, obj_trajs_pos, obj_trajs_last_pos, obj_trajs_future_state,
             obj_trajs_future_mask, center_gt_trajs,
             center_gt_trajs_mask, center_gt_final_valid_idx,
-            track_index_to_predict_new) = self.get_agent_data(
+            track_index_to_predict_new, ego_index_new) = self.get_agent_data(
                 center_objects=center_objects, obj_trajs_past=obj_trajs_past, obj_trajs_future=obj_trajs_future,
                 track_index_to_predict=track_index_to_predict, sdc_track_index=sdc_track_index,
                 timestamps=timestamps, obj_types=obj_types
@@ -400,6 +400,7 @@ class BaseDataset(Dataset):
                 'obj_trajs': obj_trajs_data,
                 'obj_trajs_mask': obj_trajs_mask,
                 'track_index_to_predict': track_index_to_predict_new,  # used to select center-features
+                'ego_index': ego_index_new,
                 'obj_trajs_pos': obj_trajs_pos,
                 'obj_trajs_last_pos': obj_trajs_last_pos,
                 
@@ -427,13 +428,18 @@ class BaseDataset(Dataset):
                 map_polylines_data, map_polylines_mask, map_polylines_center = self.get_manually_split_map_data(
                     center_objects=center_objects, map_infos=info['map_infos'])
             else:
-                if self.config.ego_get_map_data:
-                    ego_objects = obj_trajs_past[sdc_track_index, -1, :]
-                    map_polylines_data, map_polylines_mask, map_polylines_center = self.ego_get_map_data(
-                        ego_objects = ego_objects, center_objects=center_objects, map_infos=info['map_infos'])
+                if not self.config.only_train_on_ego:
+                    if self.config.ego_get_map_data:
+                        ego_objects = obj_trajs_past[sdc_track_index, -1, :]
+                        map_polylines_data, map_polylines_mask, map_polylines_center = self.ego_get_map_data(
+                            ego_objects = ego_objects, center_objects=center_objects, map_infos=info['map_infos'])
+                    else:
+                        map_polylines_data, map_polylines_mask, map_polylines_center = self.get_map_data(
+                        center_objects=center_objects, map_infos=info['map_infos'])
                 else:
                     map_polylines_data, map_polylines_mask, map_polylines_center = self.get_map_data(
                         center_objects=center_objects, map_infos=info['map_infos'])
+                        
 
             ret_dict['map_polylines'] = map_polylines_data
             ret_dict['map_polylines_mask'] = map_polylines_mask.astype(bool)
@@ -625,26 +631,32 @@ class BaseDataset(Dataset):
         object_dist_to_center[obj_trajs_mask[..., -1] == 0] = 1e10
         topk_idxs = np.argsort(object_dist_to_center, axis=-1)[:, :max_num_agents]
         
-        # modified to always include the ego vehicle
-        topk_arr = topk_idxs[0]
-        if ego_index in topk_arr:
-            idx = np.where(topk_arr == ego_index)[0][0]
-            topk_arr[idx], topk_arr[1] = topk_arr[1], topk_arr[idx]
+        if self.config['only_train_on_ego']:
+            topk_idxs = np.expand_dims(topk_idxs, axis=-1)
+            topk_idxs = np.expand_dims(topk_idxs, axis=-1)
+            obj_trajs_data = np.take_along_axis(obj_trajs_data, topk_idxs, axis=1)
+            ego_index_new = np.zeros(len(track_index_to_predict), dtype=np.int64)
         else:
-            topk_arr[-1] = ego_index
-            topk_arr[1], topk_arr[-1] = topk_arr[-1], topk_arr[1]
-            
-        topk_idxs[0] = topk_arr
-        assert ego_index in topk_idxs[0], "ego_index is not in topk_idxs"
-        assert ego_index == topk_idxs[0][1], "ego_index is not in the second index of topk_idxs"
-        
-        topk_idxs = np.expand_dims(topk_idxs, axis=-1)
-        topk_idxs = np.expand_dims(topk_idxs, axis=-1)
+            topk_arr = topk_idxs[0]
+            if ego_index in topk_arr:
+                idx = np.where(topk_arr == ego_index)[0][0]
+                topk_arr[idx], topk_arr[1] = topk_arr[1], topk_arr[idx]
+            else:
+                topk_arr[-1] = ego_index
+                topk_arr[1], topk_arr[-1] = topk_arr[-1], topk_arr[1]
 
-        sdc_data = obj_trajs_data[0, ego_index, :, :]
-        
-        obj_trajs_data = np.take_along_axis(obj_trajs_data, topk_idxs, axis=1)
-        assert np.array_equal(sdc_data, obj_trajs_data[0, 1, :, :]), "the second data of obj_trajs_data is not sdc_data"
+            topk_idxs[0] = topk_arr
+            assert ego_index in topk_idxs[0], "ego_index is not in topk_idxs"
+            assert ego_index == topk_idxs[0][1], "ego_index is not in the second index of topk_idxs"
+
+            topk_idxs = np.expand_dims(topk_idxs, axis=-1)
+            topk_idxs = np.expand_dims(topk_idxs, axis=-1)
+
+            sdc_data = obj_trajs_data[0, ego_index, :, :]
+
+            obj_trajs_data = np.take_along_axis(obj_trajs_data, topk_idxs, axis=1)
+            assert np.array_equal(sdc_data, obj_trajs_data[0, 1, :, :]), "the second data of obj_trajs_data is not sdc_data"
+            ego_index_new = np.ones(len(track_index_to_predict), dtype=np.int64)
         
         obj_trajs_mask = np.take_along_axis(obj_trajs_mask, topk_idxs[..., 0], axis=1)
         obj_trajs_pos = np.take_along_axis(obj_trajs_pos, topk_idxs, axis=1)
@@ -652,7 +664,7 @@ class BaseDataset(Dataset):
         obj_trajs_future_state = np.take_along_axis(obj_trajs_future_state, topk_idxs, axis=1)
         obj_trajs_future_mask = np.take_along_axis(obj_trajs_future_mask, topk_idxs[..., 0], axis=1)
         track_index_to_predict_new = np.zeros(len(track_index_to_predict), dtype=np.int64)
-
+        
         obj_trajs_data = np.pad(obj_trajs_data, ((0, 0), (0, max_num_agents - obj_trajs_data.shape[1]), (0, 0), (0, 0)))
         obj_trajs_mask = np.pad(obj_trajs_mask, ((0, 0), (0, max_num_agents - obj_trajs_mask.shape[1]), (0, 0)))
         obj_trajs_pos = np.pad(obj_trajs_pos, ((0, 0), (0, max_num_agents - obj_trajs_pos.shape[1]), (0, 0), (0, 0)))
@@ -666,7 +678,7 @@ class BaseDataset(Dataset):
         return (obj_trajs_data, obj_trajs_mask.astype(bool), obj_trajs_pos, obj_trajs_last_pos,
                 obj_trajs_future_state, obj_trajs_future_mask, center_gt_trajs, center_gt_trajs_mask,
                 center_gt_final_valid_idx,
-                track_index_to_predict_new)
+                track_index_to_predict_new, ego_index_new)
 
     def get_interested_agents(self, track_index_to_predict, obj_trajs_full, current_time_index, obj_types, scene_id):
         center_objects_list = []
