@@ -225,8 +225,8 @@ class BEVTPSceneContextEncoder(nn.Module):
         return rotated_points
     
     def forward(self, traj_data, pre_encoder_emb, bev_feature):
-        obj_trajs, obj_trajs_mask, obj_trajs_last_pos, track_index_to_predict = (traj_data[k] \
-                        for k in ['obj_trajs', 'obj_trajs_mask', 'obj_trajs_last_pos', 'track_index_to_predict'])
+        obj_trajs, obj_trajs_mask, obj_trajs_last_pos, ego_idx = (traj_data[k] \
+                        for k in ['obj_trajs', 'obj_trajs_mask', 'obj_trajs_last_pos', 'ego_index'])
 
         B, num_objects, _, _ = pre_encoder_emb.shape
         
@@ -239,8 +239,9 @@ class BEVTPSceneContextEncoder(nn.Module):
         ba_feat, ref_pos_ego = self.bda(bev_feat) # BEV Aggregated feature
         
         # ego-centric -> target-centric
-        ego_traj = obj_trajs[:, 1, :, :].unsqueeze(1)
-        trans_x, trans_y, rot_sin, rot_cos  = ego_traj[:, :, -1, 0], ego_traj[:, :, -1,  1], ego_traj[:, :, -1, -6], ego_traj[:, :, -1, -5]
+        B_idx = torch.arange(B, device=obj_trajs.device)
+        ego_traj = obj_trajs[B_idx, ego_idx, :, :].unsqueeze(1)
+        trans_x, trans_y, rot_sin, rot_cos = ego_traj[:, :, -1, 0], ego_traj[:, :, -1,  1], ego_traj[:, :, -1, -6], ego_traj[:, :, -1, -5]
         ref_pos_target = self.ego_to_target(ref_pos_ego, trans_x, trans_y, rot_sin, rot_cos)
         
         # local(global) self-attention

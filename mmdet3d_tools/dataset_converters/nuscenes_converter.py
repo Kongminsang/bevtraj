@@ -173,6 +173,20 @@ def _fill_trainval_infos(nusc,
         pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token']) # translation ~ timestamp
         lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
 
+        # get map location for BEV map segmentation
+        scene_token = sample['scene_token']
+        log_token = location = None
+        for idx, d in enumerate(nusc.scene):
+            if d["token"] == scene_token:
+                log_token = d["log_token"]
+                break
+        for i, l in enumerate(nusc.log):
+            if l["token"] == log_token:
+                location = l["location"]
+                break
+        if location is None:
+            print("Location not found for scene token: ", scene_token)
+        
         mmengine.check_file_exist(lidar_path)
 
         info = {
@@ -186,7 +200,8 @@ def _fill_trainval_infos(nusc,
             'ego2global_translation': pose_record['translation'],
             'ego2global_rotation': pose_record['rotation'],
             'timestamp': sample['timestamp'],
-            'scene_token': sample['scene_token'],
+            'scene_token': scene_token,
+            'location': location
         }
 
         l2e_r = info['lidar2ego_rotation']
@@ -216,17 +231,6 @@ def _fill_trainval_infos(nusc,
         # obtain sweeps for a single key-frame
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
         sweeps = []
-        # some frame can have 5 sweeps, some can have 10 sweeps
-        # while len(sweeps) < max_sweeps:
-        #     if not sd_rec['prev'] == '':
-        #         sd_rec = nusc.get('sample_data', sd_rec['prev'])
-        #         if not sd_rec['prev'] == '':
-        #             sweep = obtain_sensor2top(nusc, sd_rec['prev'], l2e_t,
-        #                                     l2e_r_mat, e2g_t, e2g_r_mat, 'lidar')
-        #             sweeps.append(sweep)
-        #             sd_rec = nusc.get('sample_data', sd_rec['prev'])
-        #     else:
-        #         break
         while len(sweeps) < max_sweeps:
             if not sd_rec['prev'] == '':
                 sweep = obtain_sensor2top(nusc, sd_rec['prev'], l2e_t,

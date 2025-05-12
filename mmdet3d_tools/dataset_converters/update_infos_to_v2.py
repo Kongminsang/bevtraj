@@ -178,7 +178,8 @@ def get_empty_standard_data_info(
         pts_semantic_mask_path=None,
         # (str, optional): Path of instance labels for each point.
         pts_instance_mask_path=None,
-        scene_token=None)
+        scene_token=None,
+        location=None)
     return data_info
 
 
@@ -401,7 +402,7 @@ def update_nuscenes_infos(pkl_path, out_dir):
     }
     nusc = NuScenes(
         version=data_list['metadata']['version'],
-        dataroot='/media/kong/kong_ssd/mj_nuscenes', # modify
+        dataroot='./data/nuscenes',
         verbose=True)
 
     print('Start updating:')
@@ -426,6 +427,7 @@ def update_nuscenes_infos(pkl_path, out_dir):
         # bc-breaking: Timestamp has divided 1e6 in pkl infos.
         temp_data_info['timestamp'] = ori_info_dict['timestamp'] / 1e6
         temp_data_info['scene_token'] = ori_info_dict['scene_token']
+        temp_data_info['location'] = ori_info_dict['location']
         for ori_sweep in ori_info_dict['sweeps']:
             temp_lidar_sweep = get_single_lidar_sweep()
             temp_lidar_sweep['lidar_points'][

@@ -146,21 +146,19 @@ class Criterion(nn.Module):
     
     def get_goal_prediction_loss(self, goal_reg, goal_FDE, gt, traj_data):
         mask = gt[..., -1]
-        criterion = nn.SmoothL1Loss(beta=1.0)
         
         reg_loss = (torch.norm((goal_reg[:, :, :2].permute(1, 0, 2) - gt[:, -1, :2].unsqueeze(1)), 2, dim=-1) * mask[:, -1:])
         
         goal_reg_detached = goal_reg.detach()
         FDE_gt = (torch.norm(goal_reg_detached[:, :, :2].permute(1, 0, 2) - gt[:, -1, :2].unsqueeze(1), 2, dim=-1) * mask[:, -1:])
-        disp_loss = criterion(goal_FDE, FDE_gt)
+        disp_loss = self.goal_FDE_loss(goal_FDE, FDE_gt)
         
         if self.traj_type_weights:
             type_weight = self.TRAJ_TYPE_WEIGHTS[traj_data['trajectory_type']].unsqueeze(1) # size(B, 1)
             reg_loss = (reg_loss * type_weight).min(dim=1)[0].mean()
-            disp_loss = (disp_loss * type_weight).mean()
+            disp_loss = disp_loss * type_weight
         else:
             reg_loss = reg_loss.min(dim=1)[0].mean()
-            disp_loss = disp_loss.mean()
         
         return self.config['goal_reg_loss_weight'] * reg_loss + disp_loss
 

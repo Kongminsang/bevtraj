@@ -191,8 +191,8 @@ def visualize_prediction(batch, prediction, draw_index=0):
     map_mask = batch['map_polylines_mask'][draw_index].cpu().numpy()
     past_traj = batch['obj_trajs'][draw_index].cpu().numpy()
     future_traj = batch['obj_trajs_future_state'][draw_index].cpu().numpy()
-    past_traj_mask = batch['obj_trajs_mask'][draw_index].cpu().numpy()
-    future_traj_mask = batch['obj_trajs_future_mask'][draw_index].cpu().numpy()
+    ego_idx = int(batch['ego_index'][draw_index].cpu().numpy())
+    
     if isinstance(prediction, dict):
         prediction = prediction['predicted_trajectory']
     pred_future_traj = prediction[draw_index].detach().cpu().numpy()
@@ -217,7 +217,7 @@ def visualize_prediction(batch, prediction, draw_index=0):
 
     # draw past trajectory
     for idx, traj in enumerate(past_traj):
-        if idx == 1:
+        if idx == ego_idx:
             draw_trajectory(traj, line_width=2, ego=True)
         else:
             draw_trajectory(traj, line_width=2)

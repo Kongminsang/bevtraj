@@ -100,7 +100,9 @@ class BEVDeformableAggregation(nn.Module):
         self.grid_size = config['grid_size']
         
         self.ba_query = nn.Parameter(torch.zeros(self.num_ba_query, self.D), requires_grad=True)
-        self.ref_pos = nn.Parameter(self.create_uniform_2d_grid_tensor(self.num_ba_query), requires_grad=True)
+        # self.ref_pos = nn.Parameter(self.create_uniform_2d_grid_tensor(self.num_ba_query), requires_grad=True)
+        self.ref_pos = nn.Parameter(torch.empty(self.num_ba_query, 2), requires_grad=True) # (256, 2)
+        nn.init.xavier_uniform_(self.ref_pos)
         
         self.pos_scale = build_mlp(self.D, self.D, self.D, dropout=self.dropout)
         self.query_pos = build_mlp(self.D, self.D, self.D, dropout=self.dropout)

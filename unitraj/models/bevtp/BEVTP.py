@@ -84,20 +84,23 @@ class BEVTP(BaseModel):
     
     def prepare_decoder_input(self, traj_data):
         agents_in = traj_data['obj_trajs'] # (B, N, t, _)
+        B_idx = torch.arange(agents_in.size(0), device=agents_in.device)
+        target_idx = traj_data['track_index_to_predict']
+        ego_idx = traj_data['ego_index']
         
         # ego-vehicle centric target agent dynamics
-        ego_loc = agents_in[:, 1, -1:, :2].repeat(1, self.t, 1) # (B, t, 2)
-        ego_sin, ego_cos = agents_in[:, 1, -1:, -6:-5].repeat(1, self.t, 1), agents_in[:, 1, -1:, -5:-4].repeat(1, self.t, 1) # (B, t, 1)
+        ego_loc = agents_in[B_idx, ego_idx, -1:, :2].repeat(1, self.t, 1) # (B, t, 2)
+        ego_sin, ego_cos = agents_in[B_idx, ego_idx, -1:, -6:-5].repeat(1, self.t, 1), agents_in[B_idx, ego_idx, -1:, -5:-4].repeat(1, self.t, 1) # (B, t, 1)
         
         rotation_matrix = torch.stack([
             torch.cat([ego_cos, -ego_sin], dim=-1),
             torch.cat([ego_sin, ego_cos], dim=-1)
         ], dim=-2)
         
-        target_loc = agents_in[:, 0, :, :2] # (B, t, 2)
-        target_vel = agents_in[:, 0, :, -4:-2] # (B, t, 2)
-        target_acc = agents_in[:, 0, :, -2:] # (B, t, 2)
-        target_size = agents_in[:, 0, :, 3:6] # (B, t, 3)
+        target_loc = agents_in[B_idx, target_idx, :, :2] # (B, t, 2)
+        target_vel = agents_in[B_idx, target_idx, :, -4:-2] # (B, t, 2)
+        target_acc = agents_in[B_idx, target_idx, :, -2:] # (B, t, 2)
+        target_size = agents_in[B_idx, target_idx, :, 3:6] # (B, t, 3)
         
         target_loc = target_loc - ego_loc
         target_loc, target_vel, target_acc = map(lambda x: torch.matmul(x.unsqueeze(-2), rotation_matrix).squeeze(-2), \
@@ -107,13 +110,13 @@ class BEVTP(BaseModel):
         
         # (target_agnet-centric) target agent dynamics
         tc_indices = [0, 1, -4, -3, -2, -1, 3, 4, 5]
-        target_agent_dynamics = agents_in[:, 0, :, tc_indices] # (B, t, 9)
+        target_agent_dynamics = agents_in[B_idx, target_idx, ...][..., tc_indices] # (B, t, 9)
         
         # ego-vehicle dynamics
         ego_dynamics = {
-            'ego_loc': agents_in[:, 1, -1, :2], # (B, 2)
-            'ego_sin': agents_in[:, 1, -1, -6:-5], # (B, 1)
-            'ego_cos': agents_in[:, 1, -1, -5:-4], # (B, 1)
+            'ego_loc': agents_in[B_idx, ego_idx, -1, :2], # (B, 2)
+            'ego_sin': agents_in[B_idx, ego_idx, -1, -6:-5], # (B, 1)
+            'ego_cos': agents_in[B_idx, ego_idx, -1, -5:-4], # (B, 1)
         }
         
         return ego_centric_dynamics, target_agent_dynamics, ego_dynamics

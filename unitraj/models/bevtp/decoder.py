@@ -82,7 +82,7 @@ class BEVTPDecoderLayer(nn.Module):
         
         # coord transform
         ego_loc, ego_sin, ego_cos = ego_dynamics['ego_loc'], ego_dynamics['ego_sin'], ego_dynamics['ego_cos']
-        ego_loc, ego_sin, ego_cos = map(lambda t: t.unsqueeze(1).unsqueeze(0).repeat(self.K, 1, self.T, 1), (ego_loc, ego_sin, ego_cos)) # (K, B, T, _)
+        ego_loc, ego_sin, ego_cos = map(lambda t: t.unsqueeze(1).unsqueeze(0).repeat(self.K, 1, self.T, 1), (ego_loc, ego_sin, ego_cos))
         
         rotation_matrix = torch.stack([
             torch.cat([ego_cos, -ego_sin], dim=-1),
@@ -90,10 +90,10 @@ class BEVTPDecoderLayer(nn.Module):
         ], dim=-2)
         
         ref_points = ref_points - ego_loc
-        ref_points = torch.matmul(ref_points.unsqueeze(-2), rotation_matrix).squeeze(-2) # (K, B, T, 2)
+        ref_points = torch.matmul(ref_points.unsqueeze(-2), rotation_matrix).squeeze(-2)
         
         # adequate coord system for F.grid_sample in bev_cross_attn
-        ref_points[..., 1] *= -1 # (BEV feature coordinates have inverted y-axis compared to unitraj)
+        ref_points[..., 1] = ref_points[..., 1] * -1 # (BEV feature coordinates have inverted y-axis compared to unitraj)
         
         # cross attn with bev feature
         dec_embed = self.norm[1](self.bev_cross_attn(dec_embed, bev_feat, query_scale, ref_points))
@@ -246,7 +246,7 @@ class BEVTPDecoder(nn.Module):
         goal_candidate = torch.matmul(goal_candidate.unsqueeze(-2), rotation_matrix).squeeze(-2)
         
         # adequate coord system for F.grid_sample in bev_cross_attn
-        goal_candidate[..., 1] *= -1 # (BEV feature coordinates have inverted y-axis compared to unitraj)
+        goal_candidate[..., 1] = goal_candidate[..., 1] * -1 # (BEV feature coordinates have inverted y-axis compared to unitraj)
         
         # cross attn with scene feature
         dec_embed = self.norm_l1[1](self.bev_cross_attn_l1(dec_embed=dec_embed, bev_feat=bev_feat,
