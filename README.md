@@ -8,7 +8,8 @@ Trajectory prediction from raw sensor data without relying on HD maps.
 
 ## 🛠️ Installation
 
-🔥 BEVTP is powered by [MMDetection3D](https://github.com/open-mmlab/mmdetection3d), [UniTraj](https://github.com/vita-epfl/UniTraj/tree/main), [Scenarionet](https://github.com/metadriverse/scenarionet) and [BEVFusion](https://github.com/mit-han-lab/bevfusion)
+🔥 BEVTP is powered by [MMDetection3D](https://github.com/open-mmlab/mmdetection3d), [UniTraj](https://github.com/vita-epfl/UniTraj/tree/main), [Scenarionet](https://github.com/metadriverse/scenarionet) and [BEVFusion](https://github.com/mit-han-lab/bevfusion).
+
 Follow the steps below to set up the environment and install all dependencies for BEVTP.
 
 ### 1. Create Conda Environment & Install PyTorch
