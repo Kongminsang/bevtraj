@@ -29,7 +29,7 @@ Follow the official instructions from [mmdetection3d documentation](https://mmde
 pip install -U openmim
 mim install mmengine
 mim install 'mmcv==2.1.0'
-mim install 'mmdet==3.2.0’
+mim install 'mmdet==3.2.0'
 ```
 ```bash
 git clone https://github.com/open-mmlab/mmdetection3d.git
