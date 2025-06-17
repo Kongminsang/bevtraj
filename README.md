@@ -2,7 +2,7 @@
 # BEVTraj
 
 Trajectory prediction from raw sensor data without relying on HD maps.
-![BEVTraj Overview](figs/bevtraj.png)
+![BEVTraj Overview](figs/bevtraj.jpg)
 
 ---
 
