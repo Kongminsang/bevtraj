@@ -11,4 +11,4 @@ eval_nuscenes: False # whether to evaluate with nuscenes evaluation tool
 eval_waymo: False # whether to evaluate with waymo evaluation tool
 
 defaults:
-  - method: bevtp_nusc
+  - method: bevtraj_nusc

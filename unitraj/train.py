@@ -9,7 +9,6 @@ from datasets import build_dataset
 from utils.utils import set_seed, find_latest_checkpoint
 from utils.config import save_config_as_txt
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.strategies import DDPStrategy
 import hydra
 from omegaconf import OmegaConf
 import os

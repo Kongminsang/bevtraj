@@ -14,6 +14,7 @@ outputs/
 pretraining_ckpt/
 UniTraj.egg-info/
 mmdet3d.egg-info/
+bevtraj.egg-info/
 .vscode/
 tmp/
 wandb/

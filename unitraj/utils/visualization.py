@@ -1,7 +1,9 @@
-import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
+
+from matplotlib import patches
+from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 
 
@@ -157,83 +159,97 @@ def concatenate_varying(image_list, column_counts):
     return final_image
 
 
-def visualize_prediction(batch, prediction, draw_index=0):
+def draw_vehicle_box(ax, center_x, center_y, sin_theta, cos_theta, 
+                     length=4.0, width=1.8, color='green', alpha=0.8):
+    
+    rectangle = np.array([
+        [-length / 2, -width / 2],
+        [ length / 2, -width / 2],
+        [ length / 2,  width / 2],
+        [-length / 2,  width / 2]
+    ])
+    rotation_matrix = np.array([
+        [cos_theta, -sin_theta],
+        [sin_theta,  cos_theta]
+    ])
+    rotated = rectangle @ rotation_matrix.T
+    translated = rotated + np.array([center_x, center_y])
+    polygon = patches.Polygon(translated, closed=True, edgecolor=color, facecolor=color, alpha=alpha, zorder=15)
+    ax.add_patch(polygon)
+
+
+def visualize_prediction(batch, prediction, draw_index=0,
+                         window_size=40, x_offset=20, traj_color='#FF8C00'):
+
     def draw_line_with_mask(point1, point2, color, line_width=4):
         ax.plot([point1[0], point2[0]], [point1[1], point2[1]], linewidth=line_width, color=color)
-    
-    def interpolate_color_gt(t, total_t, r=0):
-        # - R = 0.3: Slightly warm green → teal → blue with a purple tint.
-        # - R = 0.5: Warm yellow-green → neutral gray → purple.
-        # - R = 0.7: Strongly warm yellow-green → reddish gray → purple-blue.
-        return (r, 1 - t / total_t, t / total_t)
-    
-    def interpolate_color_pred(t, total_t):
-        return (1 - t / total_t, 0, t / total_t)
-
-    def draw_trajectory(trajectory, line_width, ego=False, future=False):
-        total_t = len(trajectory)
-        for t in range(total_t - 1):
-            if ego:
-                if future:
-                    color = (0.5, 0, 0.5) # purple
-                else:
-                    color = (0, 0.5, 0)  # green
-            else:
-                if future:
-                    color = interpolate_color_gt(t, total_t, r=1) # red
-                else:
-                    color = interpolate_color_gt(t, total_t, r=0) # blue
-            if trajectory[t, 0] and trajectory[t + 1, 0]:
-                draw_line_with_mask(trajectory[t], trajectory[t + 1], color=color, line_width=line_width)
 
     batch = batch['input_dict']
     map_lanes = batch['map_polylines'][draw_index].cpu().numpy()
     map_mask = batch['map_polylines_mask'][draw_index].cpu().numpy()
-    past_traj = batch['obj_trajs'][draw_index].cpu().numpy()
-    future_traj = batch['obj_trajs_future_state'][draw_index].cpu().numpy()
-    ego_idx = int(batch['ego_index'][draw_index].cpu().numpy())
+    curr_traj = batch['obj_trajs'][draw_index][:, -1].cpu().numpy()
+    pred_future_prob = prediction['predicted_probability'][draw_index].detach().cpu().numpy()
+    pred_future_traj = prediction['predicted_trajectory'][draw_index].detach().cpu().numpy()
+    target_idx= batch['track_index_to_predict'][draw_index].item()
     
     if isinstance(prediction, dict):
         prediction = prediction['predicted_trajectory']
     pred_future_traj = prediction[draw_index].detach().cpu().numpy()
 
+    # make plot
+    _, ax = plt.subplots(figsize=(12, 12), dpi=300)
+    ax.set_aspect('equal')
+    ax.set_xlim(-window_size + x_offset, window_size + x_offset)
+    ax.set_ylim(-window_size, window_size)
+    
+    cmap = LinearSegmentedColormap.from_list("alpha_orange", [(1, 1, 1, 0), (1, 0.549, 0, 1)])
+    norm = mcolors.Normalize(vmin=0, vmax=1)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    cbar = plt.colorbar(sm, ax=ax, orientation='vertical', shrink=0.8)
+    cbar.set_label('Probability', fontsize=12)
+    
+    # Plot the map with mask check
     map_xy = map_lanes[..., :2]
-
     map_type = map_lanes[..., 0, -20:]
 
-    # draw map
-    fig, ax = plt.subplots()
-    ax.set_aspect('equal')
-    # Plot the map with mask check
     for idx, lane in enumerate(map_xy):
         lane_type = map_type[idx]
-        # convert onehot to index
         lane_type = np.argmax(lane_type)
         if lane_type in [1, 2, 3]:
             continue
         for i in range(len(lane) - 1):
             if map_mask[idx, i] and map_mask[idx, i + 1]:
-                draw_line_with_mask(lane[i], lane[i + 1], color='grey', line_width=1.5)
+                draw_line_with_mask(lane[i], lane[i + 1], color='grey', line_width=3)
 
-    # draw past trajectory
-    for idx, traj in enumerate(past_traj):
-        if idx == ego_idx:
-            draw_trajectory(traj, line_width=2, ego=True)
-        else:
-            draw_trajectory(traj, line_width=2)
+    # draw trajectory of target agent
+    sorted_ids = np.argsort(pred_future_prob)[::-1]  
+    top6_ids = sorted_ids[:6]
+              
+    for mode_idx in top6_ids:
+        traj = pred_future_traj[mode_idx][:, :2]           
+        prob = pred_future_prob[mode_idx]
+        alpha = 0.2 + 0.7 * prob
 
-    # draw future trajectory
-    for idx, traj in enumerate(future_traj):
-        if idx == 1:
-            draw_trajectory(traj, line_width=2, ego=True, future=True)
-        else:
-            draw_trajectory(traj, line_width=2, future=True)
+        ax.scatter(
+            traj[:, 0], traj[:, 1],
+            s=70,
+            marker='o',
+            facecolors=traj_color,
+            edgecolors=traj_color,
+            linewidths=1.5,
+            alpha=alpha,
+            zorder=10
+        )
 
-    # predicted future trajectory is (n,future_len,2) with n possible future trajectories, visualize all of them
-    for idx, traj in enumerate(pred_future_traj):
-        # calculate color based on probability
-        for i in range(len(traj) - 1):
-            color = interpolate_color_pred(i, len(traj))
-            draw_line_with_mask(traj[i], traj[i + 1], color=color, line_width=2)
-
+    # draw vehicle (2D box)
+    for idx, traj in enumerate(curr_traj):
+        if not np.isclose(traj[6], 1.0):
+            continue
+        if np.isclose(traj[10], 1.0): vehicle_color = 'limegreen'
+        elif idx == target_idx: vehicle_color = 'indianred'
+        else: vehicle_color = 'cornflowerblue'
+        
+        draw_vehicle_box(ax, center_x=traj[0], center_y=traj[1], sin_theta=traj[33], cos_theta=traj[34], \
+                         color=vehicle_color, alpha=0.8)
+    
     return plt

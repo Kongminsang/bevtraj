@@ -1,7 +1,8 @@
-from .bevtp.BEVTP import BEVTP
+from .bevtraj.BEVTraj import BEVTraj
+
 
 __all__ = {
-    'BEVTP': BEVTP,
+    'BEVTraj': BEVTraj,
 }
 
 def build_model(config):

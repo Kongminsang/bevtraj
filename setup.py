@@ -14,9 +14,9 @@ def make_cuda_ext(name, module, sources):
 
 if __name__ == '__main__':
     setup(
-        name='bevtp',
+        name='bevtraj',
         version=1.0,
-        description='bevtp',
+        description='bevtraj',
         author='Minsang Kong',
         author_email='gms0725@kookmin.ac.kr',
         license='MIT',
@@ -44,7 +44,7 @@ if __name__ == '__main__':
         ext_modules=[
             make_cuda_ext(
                 name='knn_cuda',
-                module='unitraj.models.bevtp.mtr.ops.knn',
+                module='unitraj.models.bevtraj.mtr.ops.knn',
                 sources=[
                     'src/knn.cpp',
                     'src/knn_gpu.cu',
@@ -53,7 +53,7 @@ if __name__ == '__main__':
             ),
             make_cuda_ext(
                 name='attention_cuda',
-                module='unitraj.models.bevtp.mtr.ops.attention',
+                module='unitraj.models.bevtraj.mtr.ops.attention',
                 sources=[
                     'src/attention_api.cpp',
                     'src/attention_func_v2.cpp',

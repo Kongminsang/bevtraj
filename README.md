@@ -1,22 +1,22 @@
 
-# BEVTP
+# BEVTraj
 
 Trajectory prediction from raw sensor data without relying on HD maps.
-![BEVTP Overview](figs/bevtp.png)
+![BEVTraj Overview](figs/bevtraj.png)
 
 ---
 
 ## 🛠️ Installation
 
-🔥 BEVTP is powered by [MMDetection3D](https://github.com/open-mmlab/mmdetection3d), [UniTraj](https://github.com/vita-epfl/UniTraj/tree/main), [Scenarionet](https://github.com/metadriverse/scenarionet) and [BEVFusion](https://github.com/mit-han-lab/bevfusion).
+🔥 BEVTraj is powered by [MMDetection3D](https://github.com/open-mmlab/mmdetection3d), [UniTraj](https://github.com/vita-epfl/UniTraj/tree/main), [Scenarionet](https://github.com/metadriverse/scenarionet) and [BEVFusion](https://github.com/mit-han-lab/bevfusion).
 
-Follow the steps below to set up the environment and install all dependencies for BEVTP.
+Follow the steps below to set up the environment and install all dependencies for BEVTraj.
 
 ### 1. Create Conda Environment & Install PyTorch
 
 ```bash
-conda create -n bevtp python=3.9
-conda activate bevtp
+conda create -n bevtraj python=3.9
+conda activate bevtraj
 
 # Install PyTorch (adjust CUDA version as needed)
 pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu116
@@ -50,10 +50,10 @@ If there are errors related to `bev_pool` or `voxel_layer` extension modules, ma
 
 ```bash
 cp mmdetection3d/projects/BEVFusion/bevfusion/ops/bev_pool/bev_pool_ext.*.so
-bevtp/unitraj/models/bevtp/bevfusion/ops/bev_pool/
+bevtraj/unitraj/models/bevtraj/bevfusion/ops/bev_pool/
 
 cp mmdetection3d/projects/BEVFusion/bevfusion/ops/voxel/voxel_layer.*.so
-bevtp/unitraj/models/bevtp/bevfusion/ops/voxel/
+bevtraj/unitraj/models/bevtraj/bevfusion/ops/voxel/
 ```
 
 ### 3. Scenarionet Setup
@@ -70,7 +70,7 @@ cd scenarionet
 pip install -e .
 ```
 
-### 4. BEVTP Setup
+### 4. BEVTraj Setup
 
 ```bash
 pip install -r requirements.txt
@@ -89,7 +89,7 @@ Please download the required datasets from the official links below:
 - [Argoverse 2 Dataset](https://argoverse.github.io/user-guide/getting_started.html)
  
 ```
-BEVTP/
+BEVTraj/
 ├── data/
 │   ├── nuscenes/
 │   │   ├── v1.0-trainval/
@@ -110,14 +110,14 @@ python mmdet3d_tools/create_data.py nuscenes \
     --root-path data/nuscenes \
     --version v1.0 \
     --out-dir data/nuscenes \
-    --extra-tag BEVTP
+    --extra-tag BEVTraj
 
 # Convert Argoverse 2
 python mmdet3d_tools/create_data.py argo2 \
     --root-path data/av2_sensor \
     --version trainval \
     --out-dir data/av2_sensor \
-    --extra-tag BEVTP \
+    --extra-tag BEVTraj \
     --workers 8
 ```
 
@@ -163,10 +163,10 @@ Download the pretrained BEVFusion segmentation checkpoint from the link below an
 
 ```bash
 # nuscenes
-python unitraj/train.py method=bevtp_nusc
+python unitraj/train.py method=bevtraj_nusc
 
 # argoverse 2 sensor
-python unitraj/train.py method=bevtp_av2sensor
+python unitraj/train.py method=bevtraj_av2sensor
 
 ```
 
