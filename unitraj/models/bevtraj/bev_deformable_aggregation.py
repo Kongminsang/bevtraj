@@ -279,12 +279,18 @@ class BDA_DEC(BEVDeformableAggregation):
             'ec': MLP(self.config['target_attr'], self.D, self.t_D, 2),
             'ec_t': MLP(self.t_D * self.t, self.D // 2, self.D, 2),
             'ec_q': QueryConditionedDynamics(self.D, self.D),
-            'ec_to_pos': MLP(self.D, self.D, 2, 2),
             'tc': MLP(self.config['target_attr'], self.D, self.t_D, 2),
             'tc_t': MLP(self.t_D * self.t, self.D // 2, self.D, 2),
             'tc_q': QueryConditionedDynamics(self.D, self.D),
-            # 'tc_to_pos': MLP(self.D, self.D, 2, 2),
-            'hyb': MLP(self.D + self.D, self.D, self.D, 3),
+            'motion_fuse': MLP(self.D + self.D, self.D, self.D, 3),
+        })
+
+        self.anchor_enc = nn.ModuleDict({
+            'tc': MLP(self.D, self.D, self.D, 2),
+            'ec': MLP(self.D, self.D, self.D, 2),
+            'fuse': MLP(self.D + self.D, self.D, self.D, 3),
+            'gate': MLP(self.D + self.D, self.D, self.D, 2),
+            'out': MLP(self.D + self.D, self.D, self.D, 3),
         })
 
         self.bda_layers = nn.ModuleList([
@@ -321,20 +327,35 @@ class BDA_DEC(BEVDeformableAggregation):
         ref_pos = target_to_ego(ref_pos_target, trans_x, trans_y, rot_sin, rot_cos)
 
         # =============================== prototype ================================
+        # Motion history and anchor geometry play different roles for goal selection:
+        # history says which futures are plausible, while anchor geometry says which
+        # concrete candidate location this query represents.
+        # Encode them separately first, then fuse with a gate so anchor position can
+        # steer the query without overwriting the motion evidence.
 
         ec_d = self.dynamics_enc['ec'](ec_dyn).reshape(B, -1) # (B, t_D * t)
-        ec_d = self.dynamics_enc['ec_t'](ec_d).unsqueeze(0).expand(self.num_ba_query, -1, -1) # (num_ba_query, B, D)
-        ec_d = self.dynamics_enc['ec_q'](ec_d.permute(1, 0, 2), output) # (B, num_ba_query, D)
-        
-        ec_pos = self.dynamics_enc['ec_to_pos'](ec_d).tanh() * self.denorm_scale[None, None, :]
-        ec_pos= gen_sineembed_for_position(ec_pos, hidden_dim=self.D, temperature=10000)
-        
-        tc_pos = gen_sineembed_for_position(ref_pos_target, hidden_dim=self.D, temperature=10000)
+        ec_d = self.dynamics_enc['ec_t'](ec_d).unsqueeze(1).expand(-1, self.num_ba_query, -1) # (B, num_ba_query, D)
+
         tc_d = self.dynamics_enc['tc'](tc_dyn).reshape(B, -1) # (B, t_D * t)
-        tc_d = self.dynamics_enc['tc_t'](tc_d).unsqueeze(0).expand(self.num_ba_query, -1, -1) # (num_ba_query, B, D)
-        tc_d = self.dynamics_enc['tc_q'](tc_d.permute(1, 0, 2), tc_pos) # (B, num_ba_query, D)
-                    
-        output = self.dynamics_enc['hyb'](torch.cat([tc_d, ec_pos], dim=-1)) # (B, num_ba_query, D)
+        tc_d = self.dynamics_enc['tc_t'](tc_d).unsqueeze(1).expand(-1, self.num_ba_query, -1) # (B, num_ba_query, D)
+
+        anchor_tc = gen_sineembed_for_position(ref_pos_target, hidden_dim=self.D, temperature=10000)
+        anchor_ec = gen_sineembed_for_position(ref_pos, hidden_dim=self.D, temperature=10000)
+        anchor_feat = self.anchor_enc['fuse'](
+            torch.cat([
+                self.anchor_enc['tc'](anchor_tc),
+                self.anchor_enc['ec'](anchor_ec),
+            ], dim=-1)
+        )
+
+        ec_d = self.dynamics_enc['ec_q'](ec_d, anchor_feat) # (B, num_ba_query, D)
+        tc_d = self.dynamics_enc['tc_q'](tc_d, anchor_feat) # (B, num_ba_query, D)
+
+        motion_feat = self.dynamics_enc['motion_fuse'](torch.cat([tc_d, ec_d], dim=-1))
+        anchor_gate = torch.sigmoid(self.anchor_enc['gate'](torch.cat([motion_feat, anchor_feat], dim=-1)))
+        output = self.anchor_enc['out'](
+            torch.cat([motion_feat, anchor_gate * anchor_feat], dim=-1)
+        ) # (B, num_ba_query, D)
 
         ref_pos_norm = ref_pos / self.denorm_scale[None, None, :]
         query_sine_embed = gen_sineembed_for_position(ref_pos, hidden_dim=self.D, temperature=10000)

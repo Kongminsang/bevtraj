@@ -150,6 +150,8 @@ class BEVTrajDecoder(nn.Module):
 
         # classification
         self.bda_sgcp = BDA_DEC(self.config['bda_dec'], self.D)
+        self.goal_pos_enc = MLP(self.D, self.D, self.D, 2)
+        self.goal_score_fuse = MLP(self.D + self.D, self.D, self.D, 3)
         self.goal_prob = MLP(self.D, self.D, 1, 2)
         # self.goal_FDE = MLP(self.D, self.D, 1, 2)
 
@@ -240,7 +242,13 @@ class BEVTrajDecoder(nn.Module):
 
         B, _, D = bda_token.shape
 
-        goal_logit = self.goal_prob(bda_token).squeeze(-1)
+        goal_pos_embed = gen_sineembed_for_position(
+            bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
+        )
+        goal_score_feat = self.goal_score_fuse(
+            torch.cat([bda_token, self.goal_pos_enc(goal_pos_embed)], dim=-1)
+        )
+        goal_logit = self.goal_prob(goal_score_feat).squeeze(-1)
         goal_prob  = F.softmax(goal_logit, dim=-1)
 
         # top-k
