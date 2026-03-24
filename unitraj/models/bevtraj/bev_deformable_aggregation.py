@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from unitraj.models.bevtraj.linear import build_mlp, MLP, FFN
 from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to_ego
+from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA
 
 
 class QueryConditionedDynamics(nn.Module):
@@ -277,8 +278,7 @@ class BDA_DEC(BEVDeformableAggregation):
         self.t_D = config['t_dims']
 
         self.dynamics_enc = nn.ModuleDict({
-            'tc': MLP(self.config['target_attr'], self.D, self.t_D, 2),
-            'tc_t': MLP(self.t_D * self.t, self.D // 2, self.D, 2),
+            'tc': MLP(self.config['target_attr'], self.D, self.D, 2),
             'tc_q': QueryConditionedDynamics(self.D, self.D),
             'motion_fuse': MLP(self.D + self.D, self.D, self.D, 3),
         })
@@ -287,6 +287,18 @@ class BDA_DEC(BEVDeformableAggregation):
             'tc': MLP(self.D, self.D, self.D, 2),
             'rel': MLP(8, self.D, self.D, 2),
         })
+        self.tc_temporal_mha = TemporalMHA(self.D, self.config['bda_layer']['num_heads'], self.dropout)
+        self.tc_temporal_norm = nn.LayerNorm(self.D)
+        self.tc_anchor_attn = nn.MultiheadAttention(self.D, self.config['bda_layer']['num_heads'], dropout=self.dropout, batch_first=True)
+        self.tc_anchor_norm = nn.LayerNorm(self.D)
+        self.history_time_embedding_mlp = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.GELU(),
+            nn.Linear(64, self.D),
+        )
+        self.register_buffer('history_time', torch.arange(self.t).float().unsqueeze(-1))
+        self.history_dt = config.get('dt', 0.1)
+        self.history_time_alpha = nn.Parameter(torch.tensor(1.0))
         self.motion_to_query_pos = MLP(self.D, self.D, self.D, 2)
         self.motion_gate = MLP(self.D + self.D, self.D, self.D, 2)
 
@@ -335,6 +347,12 @@ class BDA_DEC(BEVDeformableAggregation):
         ], dim=-1)
         return rel_feat
 
+    def build_history_time_pe(self, batch_size, dtype, device):
+        t = (self.history_time * self.history_dt).to(device=device, dtype=dtype)
+        pe = self.history_time_embedding_mlp(t)  # [t, D]
+        pe = pe.unsqueeze(1).repeat(1, batch_size, 1)  # [t, B, D]
+        return self.history_time_alpha * pe
+
     def forward(self, bev_feat, ec_dyn, tc_dyn, ego_dyn):
         B = bev_feat.shape[0]
         # output = self.ba_query[None].repeat(B, 1, 1)
@@ -355,8 +373,13 @@ class BDA_DEC(BEVDeformableAggregation):
         # for BEV lookup through ref_pos. Before encoding anchor positions, explicitly
         # describe how each anchor relates to current target motion.
 
-        tc_d = self.dynamics_enc['tc'](tc_dyn).reshape(B, -1) # (B, t_D * t)
-        tc_d = self.dynamics_enc['tc_t'](tc_d).unsqueeze(1).expand(-1, self.num_ba_query, -1) # (B, num_ba_query, D)
+        tc_step_feat = self.dynamics_enc['tc'](tc_dyn)  # (B, t, D)
+        tc_time_pe = self.build_history_time_pe(B, tc_step_feat.dtype, tc_step_feat.device)
+        tc_step_feat_temporal = self.tc_temporal_mha(
+            tc_step_feat.permute(1, 0, 2),
+            tc_time_pe,
+        ).permute(1, 0, 2)
+        tc_step_feat = self.tc_temporal_norm(tc_step_feat + tc_step_feat_temporal)
 
         anchor_tc = gen_sineembed_for_position(ref_pos_target, hidden_dim=self.D, temperature=10000)
         anchor_feat = self.anchor_enc['tc'](anchor_tc)
@@ -365,6 +388,12 @@ class BDA_DEC(BEVDeformableAggregation):
         anchor_rel_feat = self.anchor_enc['rel'](anchor_rel_feat)
         anchor_feat = anchor_feat + anchor_rel_feat
 
+        tc_d = self.tc_anchor_attn(
+            query=anchor_feat,
+            key=tc_step_feat,
+            value=tc_step_feat,
+        )[0]
+        tc_d = self.tc_anchor_norm(tc_d + anchor_feat)
         tc_d = self.dynamics_enc['tc_q'](tc_d, anchor_feat) # (B, num_ba_query, D)
         motion_feat = self.dynamics_enc['motion_fuse'](torch.cat([tc_d, anchor_feat], dim=-1))
         output = output + motion_feat
