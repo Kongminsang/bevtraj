@@ -36,7 +36,7 @@ class QueryConditionedDynamics(nn.Module):
         B, N, _ = query_emb.shape
         gamma_beta = self.modulator(query_emb) #(B, N, 2 * hidden_dim)
         gamma, beta = gamma_beta.chunk (2, dim=-1) #(B, N, hidden_dim) each
-        conditioned = gamma * dynamics + beta #(B, N, hidden_dim)
+        conditioned = (1 + gamma) * dynamics + beta #(B, N, hidden_dim)
         return conditioned
 
 
@@ -51,36 +51,36 @@ class DeformAttn(nn.Module):
         self.head_dims = self.D // self.n_heads
         
         self.sampling_offsets = build_mlp(self.D, self.D, self.n_heads * self.n_points * 2, dropout=0.0)
-        self.attn_weights = build_mlp(self.D, self.D, self.n_heads * self.n_points, dropout=0.0)
+        self.attn_weights = build_mlp(self.D * 2, self.D, self.n_heads * self.n_points, dropout=0.0)
         self.value_proj = nn.Conv2d(self.head_dims, self.head_dims, kernel_size=1)
-        self.output_proj = build_mlp(self.D, self.D, self.D, dropout=0.0)
+        self.output_proj = build_mlp(self.D * 2, self.D, self.D, dropout=0.0)
         
         self.register_buffer('offset_normalizer', torch.tensor(grid_size, dtype=torch.float32))
         
-    def forward(self, ba_query, ref_pos, bev_feat):
+    def forward(self, query_content, query_pos, ref_pos, bev_feat):
         B, _, H, W = bev_feat.shape
-        N = ba_query.shape[1]
-        
+        N = query_content.shape[1]
+
         value = bev_feat.reshape(B, self.n_heads, -1, H, W).reshape(B*self.n_heads, -1, H, W)
         value = self.value_proj(value)
-        
-        sampling_offsets = self.sampling_offsets(ba_query).reshape(B, N, self.n_heads, self.n_points, 2).permute(0, 2, 1, 3, 4)
+
+        sampling_offsets = self.sampling_offsets(query_pos).reshape(B, N, self.n_heads, self.n_points, 2).permute(0, 2, 1, 3, 4)
         sampling_locations = ref_pos.unsqueeze(1).unsqueeze(3) + sampling_offsets / self.offset_normalizer[None, None, None, None, :]
         sampling_locations = sampling_locations.reshape(B*self.n_heads, N, self.n_points, 2)
-        
+
         sampling_locations[..., 1] = sampling_locations[..., 1] * -1 # Align with F.grid_sample coordinate system
-        
+
         sampled_feature = F.grid_sample(value, sampling_locations, align_corners=False, mode='bilinear')
         sampled_feature = sampled_feature.reshape(B, self.n_heads, -1, N, self.n_points).permute(0, 1, 3, 4, 2)
-        
-        attn_weights = self.attn_weights(ba_query).reshape(B, N, self.n_heads, self.n_points)
+
+        attn_weights = self.attn_weights(torch.cat([query_content, query_pos], dim=-1)).reshape(B, N, self.n_heads, self.n_points)
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_weights = attn_weights.permute(0, 2, 1, 3).unsqueeze(-1)
-        
+
         attn_outputs = torch.sum(sampled_feature * attn_weights, dim=3)
         attn_outputs = attn_outputs.permute(0, 2, 1, 3).reshape(B, N, -1)
-        
-        output = self.output_proj(attn_outputs)
+
+        output = self.output_proj(torch.cat([attn_outputs, query_content], dim=-1))
         return output
         
 
@@ -117,7 +117,7 @@ class BDALayer_ENC(BDALayer):
         tgt, _ = self.self_attn(tgt, tgt, ba_query)
         tgt = self.norm_layers[0](ba_query + self.dropout_layers[0](tgt))
         
-        tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos), ref_pos, bev_feat)
+        tgt2 = self.cross_attn(tgt, query_pos, ref_pos, bev_feat)
         tgt2 = self.norm_layers[1](tgt + self.dropout_layers[1](tgt2))
         
         output = self.norm_layers[2](self.ffn(tgt2))
@@ -141,9 +141,10 @@ class BDALayer_DEC(BDALayer):
         tgt = self.norm_layers[0](ba_query + self.dropout_layers[0](tgt))
         
         # Cross-Attention
-        cross_query_pos = query_sine_embed
-        
-        tgt2 = self.cross_attn(self.with_pos_embed(tgt, cross_query_pos), ref_pos, bev_feat)
+        cross_pos_scale = self.pos_scale(tgt)
+        cross_query_pos = cross_pos_scale * self.query_pos(query_sine_embed)
+
+        tgt2 = self.cross_attn(tgt, cross_query_pos, ref_pos, bev_feat)
         tgt2 = self.norm_layers[1](tgt + self.dropout_layers[1](tgt2))
         
         output = self.norm_layers[2](self.ffn(tgt2))
@@ -276,9 +277,6 @@ class BDA_DEC(BEVDeformableAggregation):
         self.t_D = config['t_dims']
 
         self.dynamics_enc = nn.ModuleDict({
-            'ec': MLP(self.config['target_attr'], self.D, self.t_D, 2),
-            'ec_t': MLP(self.t_D * self.t, self.D // 2, self.D, 2),
-            'ec_q': QueryConditionedDynamics(self.D, self.D),
             'tc': MLP(self.config['target_attr'], self.D, self.t_D, 2),
             'tc_t': MLP(self.t_D * self.t, self.D // 2, self.D, 2),
             'tc_q': QueryConditionedDynamics(self.D, self.D),
@@ -287,11 +285,10 @@ class BDA_DEC(BEVDeformableAggregation):
 
         self.anchor_enc = nn.ModuleDict({
             'tc': MLP(self.D, self.D, self.D, 2),
-            'ec': MLP(self.D, self.D, self.D, 2),
-            'fuse': MLP(self.D + self.D, self.D, self.D, 3),
-            'gate': MLP(self.D + self.D, self.D, self.D, 2),
-            'out': MLP(self.D + self.D, self.D, self.D, 3),
+            'rel': MLP(8, self.D, self.D, 2),
         })
+        self.motion_to_query_pos = MLP(self.D, self.D, self.D, 2)
+        self.motion_gate = MLP(self.D + self.D, self.D, self.D, 2)
 
         self.bda_layers = nn.ModuleList([
             BDALayer_DEC(self.config['bda_layer'], self.D, self.grid_size)
@@ -311,6 +308,33 @@ class BDA_DEC(BEVDeformableAggregation):
         # self.ba_query_dec = nn.Parameter(torch.zeros(32, self.D), requires_grad=True) # kong_fixme
         # self.num_ba_query = 32
 
+    def build_anchor_relation_feat(self, ref_pos_target, tc_dyn):
+        eps = 1e-3
+
+        dx = ref_pos_target[..., 0]
+        dy = ref_pos_target[..., 1]
+        r = torch.sqrt(dx.square() + dy.square() + eps)
+        sin_theta = dy / r
+        cos_theta = dx / r
+
+        target_vel = tc_dyn[:, -1, 2:4]
+        speed = torch.norm(target_vel, dim=-1, keepdim=True)
+        heading = target_vel / speed.clamp_min(eps)
+        heading = heading.unsqueeze(1).expand(-1, self.num_ba_query, -1)
+        heading_perp = torch.stack([-heading[..., 1], heading[..., 0]], dim=-1)
+
+        longi = (ref_pos_target * heading).sum(dim=-1)
+        lateral = (ref_pos_target * heading_perp).sum(dim=-1)
+        time_to_reach = r / speed.clamp_min(eps)
+
+        rel_feat = torch.stack([
+            dx, dy, r,
+            sin_theta, cos_theta,
+            longi, lateral,
+            time_to_reach.squeeze(-1),
+        ], dim=-1)
+        return rel_feat
+
     def forward(self, bev_feat, ec_dyn, tc_dyn, ego_dyn):
         B = bev_feat.shape[0]
         # output = self.ba_query[None].repeat(B, 1, 1)
@@ -327,38 +351,28 @@ class BDA_DEC(BEVDeformableAggregation):
         ref_pos = target_to_ego(ref_pos_target, trans_x, trans_y, rot_sin, rot_cos)
 
         # =============================== prototype ================================
-        # Motion history and anchor geometry play different roles for goal selection:
-        # history says which futures are plausible, while anchor geometry says which
-        # concrete candidate location this query represents.
-        # Encode them separately first, then fuse with a gate so anchor position can
-        # steer the query without overwriting the motion evidence.
-
-        ec_d = self.dynamics_enc['ec'](ec_dyn).reshape(B, -1) # (B, t_D * t)
-        ec_d = self.dynamics_enc['ec_t'](ec_d).unsqueeze(1).expand(-1, self.num_ba_query, -1) # (B, num_ba_query, D)
+        # tc features build query semantics, while ec coordinates remain responsible
+        # for BEV lookup through ref_pos. Before encoding anchor positions, explicitly
+        # describe how each anchor relates to current target motion.
 
         tc_d = self.dynamics_enc['tc'](tc_dyn).reshape(B, -1) # (B, t_D * t)
         tc_d = self.dynamics_enc['tc_t'](tc_d).unsqueeze(1).expand(-1, self.num_ba_query, -1) # (B, num_ba_query, D)
 
         anchor_tc = gen_sineembed_for_position(ref_pos_target, hidden_dim=self.D, temperature=10000)
-        anchor_ec = gen_sineembed_for_position(ref_pos, hidden_dim=self.D, temperature=10000)
-        anchor_feat = self.anchor_enc['fuse'](
-            torch.cat([
-                self.anchor_enc['tc'](anchor_tc),
-                self.anchor_enc['ec'](anchor_ec),
-            ], dim=-1)
-        )
+        anchor_feat = self.anchor_enc['tc'](anchor_tc)
 
-        ec_d = self.dynamics_enc['ec_q'](ec_d, anchor_feat) # (B, num_ba_query, D)
+        anchor_rel_feat = self.build_anchor_relation_feat(ref_pos_target, tc_dyn)
+        anchor_rel_feat = self.anchor_enc['rel'](anchor_rel_feat)
+        anchor_feat = anchor_feat + anchor_rel_feat
+
         tc_d = self.dynamics_enc['tc_q'](tc_d, anchor_feat) # (B, num_ba_query, D)
-
-        motion_feat = self.dynamics_enc['motion_fuse'](torch.cat([tc_d, ec_d], dim=-1))
-        anchor_gate = torch.sigmoid(self.anchor_enc['gate'](torch.cat([motion_feat, anchor_feat], dim=-1)))
-        output = self.anchor_enc['out'](
-            torch.cat([motion_feat, anchor_gate * anchor_feat], dim=-1)
-        ) # (B, num_ba_query, D)
+        motion_feat = self.dynamics_enc['motion_fuse'](torch.cat([tc_d, anchor_feat], dim=-1))
+        output = output + motion_feat
 
         ref_pos_norm = ref_pos / self.denorm_scale[None, None, :]
-        query_sine_embed = gen_sineembed_for_position(ref_pos, hidden_dim=self.D, temperature=10000)
+        motion_bias = self.motion_to_query_pos(motion_feat)
+        motion_gate = torch.sigmoid(self.motion_gate(torch.cat([anchor_feat, motion_feat], dim=-1)))
+        query_sine_embed = anchor_feat + motion_gate * motion_bias
         # ==========================================================================
 
         for lid, layer in enumerate(self.bda_layers):
