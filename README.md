@@ -1,5 +1,5 @@
 
-# BEVTraj
+# BEVTraj!
 
 Trajectory prediction from raw sensor data without relying on HD maps.
 
