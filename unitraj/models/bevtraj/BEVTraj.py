@@ -116,7 +116,17 @@ class BEVTraj(BaseModel):
         # decoding
         bev_feature = self.bev_feat_down(bev_feature)
         scene_context_feature = self.sc_feat_down(scene_context_feature)
-        output = self.decoder(scene_context_feature, bev_feature, ec_dynamics, tc_dynamics, ego_dynamics)
+        obj_valid_mask = traj_data['obj_trajs_mask'].sum(dim=-1) > 0
+        output = self.decoder(
+            scene_context_feature,
+            bev_feature,
+            ec_dynamics,
+            tc_dynamics,
+            ego_dynamics,
+            dense_future_pred=dense_future_pred,
+            obj_valid_mask=obj_valid_mask,
+            target_idx=traj_data['track_index_to_predict'],
+        )
         
         # get loss
         output['dense_future_pred'] = dense_future_pred

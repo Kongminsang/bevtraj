@@ -192,6 +192,16 @@ class BEVTrajDecoder(nn.Module):
         self.motion_reg_l1 = MotionRegHead(self.D)
         self.motion_vel_l1 = MotionVelHead(self.D)
 
+        # trajectory reasonableness scorer
+        self.traj_motion_proj = MLP(11, self.D, self.D, 2)
+        self.traj_history_proj = MLP(self.target_attr, self.D, self.D, 2)
+        self.traj_history_attn = nn.MultiheadAttention(self.D, self.num_heads, dropout=self.dropout)
+        self.traj_bev_proj = MLP(self.D, self.D, self.D, 2)
+        self.traj_interaction_proj = MLP(6, self.D, self.D, 2)
+        self.traj_score_fuse = MLP(self.D * 4, self.D, self.D, 2)
+        self.traj_score_norm = nn.LayerNorm(self.D)
+        self.traj_score_ffn = FFN(self.D, self.ffn_D, 2)
+
         # exp: DeMo-like ITP (state consistency branch)
         self.state_norm_l1 = nn.ModuleList([nn.LayerNorm(self.D) for _ in range(2)])
         self.state_context_cross_attn_l1 = nn.MultiheadAttention(self.D, self.num_heads, dropout=self.dropout)
@@ -251,19 +261,180 @@ class BEVTrajDecoder(nn.Module):
         goal_logit = self.goal_prob(goal_score_feat).squeeze(-1)
         goal_prob  = F.softmax(goal_logit, dim=-1)
 
-        # top-k
-        _, top_idx = torch.topk(goal_prob, k=self.K, dim=-1)
-
-        idx_tok = top_idx.unsqueeze(-1).expand(B, self.K, D)
-        idx_pos = top_idx.unsqueeze(-1).expand(B, self.K, 2)
-
-        mode_query = torch.gather(bda_token, dim=1, index=idx_tok).permute(1, 0, 2).contiguous()
-        goal_pos = torch.gather(bda_pos, dim=1, index=idx_pos)
+        mode_query = bda_token.permute(1, 0, 2).contiguous()
+        goal_pos = bda_pos
 
         # return mode_query, goal_prob, bda_pos, goal_reg_list, goal_FDE_list
         return mode_query, bda_pos, goal_pos, goal_prob
 
-    def initial_prediction(self, mode_query, scene_context, bev_feat, goal_candidate, ego_dyn):
+    def build_traj_motion_tokens(self, pred_traj, pred_vel):
+        pred_xy = pred_traj[..., :2]
+
+        disp = torch.zeros_like(pred_xy)
+        disp[..., 1:, :] = pred_xy[..., 1:, :] - pred_xy[..., :-1, :]
+
+        accel = torch.zeros_like(pred_vel)
+        accel[..., 1:, :] = pred_vel[..., 1:, :] - pred_vel[..., :-1, :]
+
+        speed = pred_vel.norm(dim=-1, keepdim=True)
+        accel_norm = accel.norm(dim=-1, keepdim=True)
+
+        traj_feat = torch.cat(
+            [
+                pred_xy,
+                disp,
+                pred_vel,
+                pred_traj[..., 2:4],
+                pred_traj[..., 4:5],
+                speed,
+                accel_norm,
+            ],
+            dim=-1,
+        )
+        return self.traj_motion_proj(traj_feat)
+
+    def sample_traj_bev_tokens(self, pred_xy, bev_feat, ego_dyn):
+        M, B, T, _ = pred_xy.shape
+        trans_x, trans_y, rot_sin, rot_cos = (
+            ego_dyn['ego_x'],
+            ego_dyn['ego_y'],
+            ego_dyn['ego_sin'],
+            ego_dyn['ego_cos'],
+        )
+
+        pred_xy_flat = pred_xy.permute(1, 0, 2, 3).reshape(B, M * T, 2)
+        pred_xy_ego = target_to_ego(pred_xy_flat, trans_x, trans_y, rot_sin, rot_cos)
+        pred_xy_ego = pred_xy_ego.reshape(B, M, T, 2)
+
+        grid = pred_xy_ego / self.denorm_scale[None, None, None, :]
+        grid = grid.clone()
+        grid[..., 1] = -grid[..., 1]
+        grid = grid.reshape(B, M * T, 1, 2)
+
+        bev_samples = F.grid_sample(
+            bev_feat,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        )
+        bev_samples = bev_samples.squeeze(-1).permute(0, 2, 1).reshape(B, M, T, self.D)
+        return self.traj_bev_proj(bev_samples.permute(1, 0, 2, 3).contiguous())
+
+    def build_dynamic_context(self, traj_query, tc_dyn):
+        M, B, T, D = traj_query.shape
+        history_tokens = self.traj_history_proj(tc_dyn).permute(1, 0, 2).contiguous()
+        history_tokens = history_tokens.unsqueeze(2).repeat(1, 1, M, 1).reshape(self.t, B * M, D)
+
+        query = traj_query.permute(2, 1, 0, 3).reshape(T, B * M, D)
+        dyn_ctx = self.traj_history_attn(query=query, key=history_tokens, value=history_tokens)[0]
+        return dyn_ctx.reshape(T, B, M, D).permute(2, 1, 0, 3).contiguous()
+
+    def build_interaction_tokens(self, pred_xy, pred_vel, dense_future_pred=None, obj_valid_mask=None, target_idx=None):
+        M, B, T, _ = pred_xy.shape
+        if dense_future_pred is None:
+            return pred_xy.new_zeros(M, B, T, self.D)
+
+        obj_xy = dense_future_pred[..., :2]
+        obj_vel = dense_future_pred[..., -2:]
+        num_objects = obj_xy.size(1)
+
+        traj_xy = pred_xy.permute(1, 0, 2, 3).unsqueeze(2)
+        traj_vel = pred_vel.permute(1, 0, 2, 3).unsqueeze(2)
+        obj_xy = obj_xy.unsqueeze(1)
+        obj_vel = obj_vel.unsqueeze(1)
+
+        rel_xy = traj_xy - obj_xy
+        dist = rel_xy.norm(dim=-1)
+        rel_dir = rel_xy / dist.unsqueeze(-1).clamp_min(1e-3)
+        closing = -((traj_vel - obj_vel) * rel_dir).sum(dim=-1)
+        obj_speed = obj_vel.norm(dim=-1)
+
+        if obj_valid_mask is None:
+            valid_mask = torch.ones(B, num_objects, device=pred_xy.device, dtype=torch.bool)
+        else:
+            valid_mask = obj_valid_mask.bool()
+
+        if target_idx is not None:
+            valid_mask = valid_mask.clone()
+            valid_mask[torch.arange(B, device=pred_xy.device), target_idx.long()] = False
+
+        valid_mask = valid_mask[:, None, :, None].expand(-1, M, -1, T)
+        masked_dist = dist.masked_fill(~valid_mask, 1e4)
+        weights = torch.softmax(-masked_dist, dim=2) * valid_mask.float()
+        weights = weights / weights.sum(dim=2, keepdim=True).clamp_min(1e-6)
+
+        agg_rel_xy = (weights.unsqueeze(-1) * rel_xy).sum(dim=2)
+        agg_dist = (weights * dist).sum(dim=2).unsqueeze(-1)
+        min_dist = masked_dist.amin(dim=2).unsqueeze(-1)
+        agg_closing = (weights * closing).sum(dim=2).unsqueeze(-1)
+        agg_obj_speed = (weights * obj_speed).sum(dim=2).unsqueeze(-1)
+
+        interaction_feat = torch.cat(
+            [agg_rel_xy, agg_dist, min_dist, agg_closing, agg_obj_speed],
+            dim=-1,
+        )
+        interaction_tokens = self.traj_interaction_proj(interaction_feat)
+        return interaction_tokens.permute(1, 0, 2, 3).contiguous()
+
+    def score_predicted_trajectory(
+        self,
+        dec_embed,
+        pred_traj,
+        pred_vel,
+        bev_feat,
+        ego_dyn,
+        tc_dyn,
+        dense_future_pred=None,
+        obj_valid_mask=None,
+        target_idx=None,
+        motion_cls_head=None,
+    ):
+        pred_xy = pred_traj[..., :2]
+        motion_tokens = self.build_traj_motion_tokens(pred_traj, pred_vel)
+        traj_query = dec_embed + motion_tokens
+
+        dyn_tokens = self.build_dynamic_context(traj_query, tc_dyn)
+        bev_tokens = self.sample_traj_bev_tokens(pred_xy, bev_feat, ego_dyn)
+        interaction_tokens = self.build_interaction_tokens(
+            pred_xy,
+            pred_vel,
+            dense_future_pred=dense_future_pred,
+            obj_valid_mask=obj_valid_mask,
+            target_idx=target_idx,
+        )
+
+        fused = torch.cat([traj_query, dyn_tokens, bev_tokens, interaction_tokens], dim=-1)
+        fused = self.traj_score_fuse(fused)
+        fused = self.traj_score_norm(fused)
+        fused = self.traj_score_ffn(fused)
+        return motion_cls_head(fused).squeeze(dim=-1).T
+
+    def select_topk_modes(self, tensor, top_idx):
+        if tensor.dim() == 4:
+            tensor_b = tensor.permute(1, 0, 2, 3).contiguous()
+            gather_idx = top_idx[:, :, None, None].expand(-1, -1, tensor.size(2), tensor.size(3))
+            return torch.gather(tensor_b, dim=1, index=gather_idx).permute(1, 0, 2, 3).contiguous()
+
+        if tensor.dim() == 3:
+            tensor_b = tensor.permute(1, 0, 2).contiguous()
+            gather_idx = top_idx[:, :, None].expand(-1, -1, tensor.size(2))
+            return torch.gather(tensor_b, dim=1, index=gather_idx).permute(1, 0, 2).contiguous()
+
+        raise ValueError(f'Unsupported tensor rank for top-k mode selection: {tensor.dim()}')
+
+    def initial_prediction(
+        self,
+        mode_query,
+        scene_context,
+        bev_feat,
+        goal_candidate,
+        ego_dyn,
+        tc_dyn,
+        dense_future_pred=None,
+        obj_valid_mask=None,
+        target_idx=None,
+    ):
         M, B, _ = mode_query.shape
 
         # ===================== mode localization branch =====================
@@ -325,9 +496,20 @@ class BEVTrajDecoder(nn.Module):
         dec_embed_T = dec_embed_T.permute(1, 0, 2, 3).contiguous()  # [M,B,T,D]
 
         # ===================== trajectory prediction =====================
-        mode_prob = self.motion_cls_l1(dec_embed_T).squeeze(dim=-1).T  # [B,M]
         out_dist = self.motion_reg_l1(dec_embed_T)  # [M,B,T,5]
         out_vel = self.motion_vel_l1(dec_embed_T)  # [M,B,T,2]
+        mode_prob = self.score_predicted_trajectory(
+            dec_embed=dec_embed_T,
+            pred_traj=out_dist,
+            pred_vel=out_vel,
+            bev_feat=bev_feat,
+            ego_dyn=ego_dyn,
+            tc_dyn=tc_dyn,
+            dense_future_pred=dense_future_pred,
+            obj_valid_mask=obj_valid_mask,
+            target_idx=target_idx,
+            motion_cls_head=self.motion_cls_l1,
+        )
 
         return dec_embed_T, mode_prob, out_dist, out_vel, state_pred
 
@@ -347,15 +529,39 @@ class BEVTrajDecoder(nn.Module):
             )
         goal_candidate = goal_pos.detach()
 
+        dense_future_pred = kwargs.get('dense_future_pred')
+        obj_valid_mask = kwargs.get('obj_valid_mask')
+        target_idx = kwargs.get('target_idx')
+
         # -------------------- Initial Prediction --------------------
         dec_embed, init_mode_prob, init_pred_traj, init_pred_vel, state_pred = \
-            self.initial_prediction(mode_query, scene_context, bev_feat, goal_candidate, ego_dyn)
+            self.initial_prediction(
+                mode_query,
+                scene_context,
+                bev_feat,
+                goal_candidate,
+                ego_dyn,
+                tc_dyn,
+                dense_future_pred=dense_future_pred,
+                obj_valid_mask=obj_valid_mask,
+                target_idx=target_idx,
+            )
             # self.initial_prediction(mode_query, scene_context, bev_feat, bda_pos, ego_dyn)
         
-        ref_points = init_pred_traj[..., :2].detach().clone()
         mode_probs = [init_mode_prob]
         pred_trajs = [init_pred_traj.permute(0, 2, 1, 3)]
         pred_vels = [init_pred_vel.permute(0, 2, 1, 3)]
+
+        top_idx = torch.topk(init_mode_prob, k=self.K, dim=-1).indices
+        goal_candidate_topk = torch.gather(
+            goal_candidate,
+            dim=1,
+            index=top_idx.unsqueeze(-1).expand(-1, -1, goal_candidate.size(-1)),
+        )
+        dec_embed = self.select_topk_modes(dec_embed, top_idx)
+        init_pred_traj = self.select_topk_modes(init_pred_traj, top_idx)
+        init_pred_vel = self.select_topk_modes(init_pred_vel, top_idx)
+        ref_points = init_pred_traj[..., :2].detach().clone()
         
         dec_embed = dec_embed.permute(2, 1, 0, 3).reshape(self.T, B * self.K, -1)
 
@@ -377,14 +583,24 @@ class BEVTrajDecoder(nn.Module):
                 time_pe=time_pe,
                 )
             
-            mode_prob = self.motion_cls(dec_embed).squeeze(dim=-1).T
-
             pred_traj_raw = self.motion_reg(dec_embed)          # [K, B, T, 5]
             pred_xy = pred_traj_raw[..., :2] + ref_points       # out-of-place
             pred_traj = torch.cat([pred_xy, pred_traj_raw[..., 2:]], dim=-1)
             ref_points = pred_xy.detach().clone()
 
             pred_vel = self.motion_vel(dec_embed) # [K, B, T, 2]
+            mode_prob = self.score_predicted_trajectory(
+                dec_embed=dec_embed,
+                pred_traj=pred_traj,
+                pred_vel=pred_vel,
+                bev_feat=bev_feat,
+                ego_dyn=ego_dyn,
+                tc_dyn=tc_dyn,
+                dense_future_pred=dense_future_pred,
+                obj_valid_mask=obj_valid_mask,
+                target_idx=target_idx,
+                motion_cls_head=self.motion_cls,
+            )
 
             pred_traj = pred_traj.permute(0, 2, 1, 3).contiguous()
             pred_vel = pred_vel.permute(0, 2, 1, 3).contiguous()
@@ -400,8 +616,8 @@ class BEVTrajDecoder(nn.Module):
                   'anchor_pos' : bda_pos,
                   'goal_pos' : goal_pos,
                   'goal_prob' : goal_prob,
+                  'goal_candidate_topk': goal_candidate_topk,  # [B, K, 2]
                 #   'init_top_idx': init_top_idx,                # [B, K]
-                #   'goal_candidate_topk': goal_candidate_topk,  # [B, K, 2]
                   'state_pred': state_pred, # [B, T, 2]
                 #   'goal_FDE_list': goal_FDE_list,
                 }

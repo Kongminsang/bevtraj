@@ -28,7 +28,7 @@ class Criterion(nn.Module):
         gt_decoder = gt[0]
         gt_dense_future_trajs = gt[1]
         
-        goal_candidate = goal_pos
+        goal_candidate = (goal_pos, out.get('goal_candidate_topk'))
         # goal_candidate = out['goal_reg_list'][-1].permute(1, 0, 2)
         decoder_loss = self.get_decoder_loss_hard_assign(
             modes_preds=modes_preds,
@@ -66,6 +66,13 @@ class Criterion(nn.Module):
         gt_decoder,                  # [B, T, 5] -> (x, y, vx, vy, valid)
         center_gt_final_valid_idx,   # [B]
     ):
+        if isinstance(goal_candidate, (tuple, list)):
+            goal_candidate_full = goal_candidate[0]
+            goal_candidate_topk = goal_candidate[1]
+        else:
+            goal_candidate_full = goal_candidate
+            goal_candidate_topk = None
+
         device = gt_decoder.device
         B = gt_decoder.size(0)
         b_idx = torch.arange(B, device=device)
@@ -79,8 +86,8 @@ class Criterion(nn.Module):
 
         # initial positive idx from SGCP goal candidate (full set)
         with torch.no_grad():
-            dist = (goal_candidate.detach() - gt_goal[:, None, :]).norm(dim=-1)  # [B, 64]
-            hard_idx = dist.argmin(dim=-1)                                        # [B]
+            dist = (goal_candidate_full.detach() - gt_goal[:, None, :]).norm(dim=-1)  # [B, 64]
+            hard_idx = dist.argmin(dim=-1)                                             # [B]
 
         w_cls = self.config.get('cls_weight', 2.0)
         w_reg = self.config.get('reg_weight', 1.0)
@@ -111,8 +118,15 @@ class Criterion(nn.Module):
             positive_layer_idx = (layer_idx // num_inter_layers) * num_inter_layers - 1
             if positive_layer_idx < 0:
                 # first-stage anchor from SGCP goal candidates
-                anchor_trajs = goal_candidate.detach().unsqueeze(2)
-                dist = (goal_candidate.detach() - gt_goal[:, None, :]).norm(dim=-1)
+                if pred_scores.size(1) == goal_candidate_full.size(1):
+                    cur_goal_candidate = goal_candidate_full
+                elif goal_candidate_topk is not None and pred_scores.size(1) == goal_candidate_topk.size(1):
+                    cur_goal_candidate = goal_candidate_topk
+                else:
+                    cur_goal_candidate = goal_candidate_full[:, :pred_scores.size(1)]
+
+                anchor_trajs = cur_goal_candidate.detach().unsqueeze(2)
+                dist = (cur_goal_candidate.detach() - gt_goal[:, None, :]).norm(dim=-1)
             else:
                 # use previous anchor trajectories
                 anchor_trajs = preds[positive_layer_idx].permute(2, 0, 1, 3).detach()  # [B, K, T, 5]
