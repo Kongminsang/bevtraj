@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from unitraj.models.bevtraj.bev_deformable_aggregation import BDA_DEC
 from unitraj.models.bevtraj.decoder_deform_attn import BEVDeformCrossAttn
-from unitraj.models.bevtraj.linear import MLP, FFN, MotionRegHead, MotionClsHead, MotionVelHead
+from unitraj.models.bevtraj.linear import MLP, FFN, MotionRegHead, MotionVelHead
 from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to_ego
 
 from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA, TemporalMHA_NoTimePE
@@ -105,6 +105,37 @@ class BEVTrajDecoderLayer(nn.Module):
         return dec_embed
 
 
+class TemporalModeCompressor(nn.Module):
+    def __init__(self, dim, num_heads, ffn_dim, dropout):
+        super().__init__()
+        self.seed_proj = MLP(dim * 3, dim, dim, 2)
+        self.temporal_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout)
+        self.out_proj = MLP(dim * 4, dim, dim, 2)
+        self.norm = nn.LayerNorm(dim)
+        self.ffn = FFN(dim, ffn_dim, 2, dropout=dropout)
+
+    def forward(self, tokens):
+        """
+        tokens: [M, B, T, D]
+        returns: [M, B, D]
+        """
+        M, B, T, D = tokens.shape
+        seq = tokens.permute(2, 1, 0, 3).reshape(T, B * M, D)
+
+        mean_pool = tokens.mean(dim=2)
+        last_token = tokens[:, :, -1, :]
+        max_pool = tokens.amax(dim=2)
+
+        seed = self.seed_proj(torch.cat([mean_pool, last_token, max_pool], dim=-1))
+        query = seed.permute(1, 0, 2).reshape(1, B * M, D)
+        attn_pool = self.temporal_attn(query=query, key=seq, value=seq)[0]
+        attn_pool = attn_pool.reshape(B, M, D).permute(1, 0, 2).contiguous()
+
+        fused = self.out_proj(torch.cat([attn_pool, mean_pool, last_token, max_pool], dim=-1))
+        fused = self.norm(fused)
+        return self.ffn(fused)
+
+
 class BEVTrajDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -188,7 +219,7 @@ class BEVTrajDecoder(nn.Module):
         #     nn.Sequential(nn.Linear(self.D, self.T_D * self.T), nn.GELU()),
         #     nn.Sequential(nn.Linear(self.T_D, self.D), nn.GELU())
         # ])
-        self.motion_cls_l1 = MotionClsHead(self.D, self.T_D, self.T)
+        self.mode_prob_head_l1 = MLP(self.D, self.D, 1, 2)
         self.motion_reg_l1 = MotionRegHead(self.D)
         self.motion_vel_l1 = MotionVelHead(self.D)
 
@@ -200,6 +231,12 @@ class BEVTrajDecoder(nn.Module):
         self.traj_bev_cross_attn = BEVDeformCrossAttn(**self.dca_itr_cfg)
         self.traj_bev_proj = MLP(self.D, self.D, self.D, 2)
         self.traj_interaction_proj = MLP(6, self.D, self.D, 2)
+        self.traj_scene_context_proj = MLP(self.D, self.D, self.D, 2)
+        self.traj_interaction_fuse_proj = MLP(self.D * 2, self.D, self.D, 2)
+        self.traj_query_pool = TemporalModeCompressor(self.D, self.num_heads, self.ffn_D, self.dropout)
+        self.traj_dyn_pool = TemporalModeCompressor(self.D, self.num_heads, self.ffn_D, self.dropout)
+        self.traj_bev_pool = TemporalModeCompressor(self.D, self.num_heads, self.ffn_D, self.dropout)
+        self.traj_interaction_pool = TemporalModeCompressor(self.D, self.num_heads, self.ffn_D, self.dropout)
         self.traj_score_fuse = MLP(self.D * 4, self.D, self.D, 2)
         self.traj_score_norm = nn.LayerNorm(self.D)
         self.traj_score_ffn = FFN(self.D, self.ffn_D, 2)
@@ -230,7 +267,7 @@ class BEVTrajDecoder(nn.Module):
         dec_layer = BEVTrajDecoderLayer(self.dec_layer_config)
         self.dec_layers = nn.ModuleList([copy.deepcopy(dec_layer) for _ in range(self.L_dec - 1)])
         
-        self.motion_cls = MotionClsHead(self.D, self.T_D, self.T)
+        self.mode_prob_head = MLP(self.D, self.D, 1, 2)
         self.motion_reg = MotionRegHead(self.D)
         self.motion_vel = MotionVelHead(self.D)
 
@@ -326,14 +363,23 @@ class BEVTrajDecoder(nn.Module):
         dyn_ctx = self.traj_history_attn(query=query, key=history_tokens, value=history_tokens)[0]
         return dyn_ctx.reshape(T, B, M, D).permute(2, 1, 0, 3).contiguous()
 
-    def build_interaction_tokens(self, pred_xy, pred_vel, dense_future_pred=None, obj_valid_mask=None, target_idx=None):
+    def build_interaction_tokens(
+        self,
+        pred_xy,
+        pred_vel,
+        scene_context=None,
+        dense_future_pred=None,
+        obj_valid_mask=None,
+        target_idx=None,
+    ):
         M, B, T, _ = pred_xy.shape
-        if dense_future_pred is None:
+        if dense_future_pred is None or scene_context is None:
             return pred_xy.new_zeros(M, B, T, self.D)
 
         obj_xy = dense_future_pred[..., :2]
         obj_vel = dense_future_pred[..., -2:]
         num_objects = obj_xy.size(1)
+        scene_obj_tokens = self.traj_scene_context_proj(scene_context)
 
         traj_xy = pred_xy.permute(1, 0, 2, 3).unsqueeze(2)
         traj_vel = pred_vel.permute(1, 0, 2, 3).unsqueeze(2)
@@ -371,6 +417,10 @@ class BEVTrajDecoder(nn.Module):
             dim=-1,
         )
         interaction_tokens = self.traj_interaction_proj(interaction_feat)
+        scene_tokens = torch.einsum('bmot,bod->bmtd', weights, scene_obj_tokens)
+        interaction_tokens = self.traj_interaction_fuse_proj(
+            torch.cat([interaction_tokens, scene_tokens], dim=-1)
+        )
         return interaction_tokens.permute(1, 0, 2, 3).contiguous()
 
     def score_predicted_trajectory(
@@ -381,10 +431,11 @@ class BEVTrajDecoder(nn.Module):
         bev_feat,
         ego_dyn,
         tc_dyn,
+        scene_context=None,
         dense_future_pred=None,
         obj_valid_mask=None,
         target_idx=None,
-        motion_cls_head=None,
+        mode_prob_head=None,
     ):
         pred_xy = pred_traj[..., :2]
         motion_tokens = self.build_traj_motion_tokens(pred_traj, pred_vel)
@@ -395,16 +446,25 @@ class BEVTrajDecoder(nn.Module):
         interaction_tokens = self.build_interaction_tokens(
             pred_xy,
             pred_vel,
+            scene_context=scene_context,
             dense_future_pred=dense_future_pred,
             obj_valid_mask=obj_valid_mask,
             target_idx=target_idx,
         )
 
-        fused = torch.cat([traj_query, dyn_tokens, bev_tokens, interaction_tokens], dim=-1)
+        traj_query_mode = self.traj_query_pool(traj_query)
+        dyn_tokens_mode = self.traj_dyn_pool(dyn_tokens)
+        bev_tokens_mode = self.traj_bev_pool(bev_tokens)
+        interaction_tokens_mode = self.traj_interaction_pool(interaction_tokens)
+
+        fused = torch.cat(
+            [traj_query_mode, dyn_tokens_mode, bev_tokens_mode, interaction_tokens_mode],
+            dim=-1,
+        )
         fused = self.traj_score_fuse(fused)
         fused = self.traj_score_norm(fused)
         fused = self.traj_score_ffn(fused)
-        return motion_cls_head(fused).squeeze(dim=-1).T
+        return mode_prob_head(fused).squeeze(dim=-1).T
 
     def select_topk_modes(self, tensor, top_idx):
         if tensor.dim() == 4:
@@ -427,6 +487,7 @@ class BEVTrajDecoder(nn.Module):
         goal_candidate,
         ego_dyn,
         tc_dyn,
+        scene_context_tokens=None,
         dense_future_pred=None,
         obj_valid_mask=None,
         target_idx=None,
@@ -501,10 +562,11 @@ class BEVTrajDecoder(nn.Module):
             bev_feat=bev_feat,
             ego_dyn=ego_dyn,
             tc_dyn=tc_dyn,
+            scene_context=scene_context_tokens,
             dense_future_pred=dense_future_pred,
             obj_valid_mask=obj_valid_mask,
             target_idx=target_idx,
-            motion_cls_head=self.motion_cls_l1,
+            mode_prob_head=self.mode_prob_head_l1,
         )
 
         return dec_embed_T, mode_prob, out_dist, out_vel, state_pred
@@ -512,6 +574,7 @@ class BEVTrajDecoder(nn.Module):
     def forward(self, scene_context, bev_feat, ec_dyn, tc_dyn, ego_dyn, **kwargs):
 
         B, _, _ = ec_dyn.shape
+        scene_context_tokens = scene_context
         n = scene_context.shape[1]
 
         scene_context_repeat = scene_context.unsqueeze(2).repeat(1, 1, self.T, 1)
@@ -538,6 +601,7 @@ class BEVTrajDecoder(nn.Module):
                 goal_candidate,
                 ego_dyn,
                 tc_dyn,
+                scene_context_tokens=scene_context_tokens,
                 dense_future_pred=dense_future_pred,
                 obj_valid_mask=obj_valid_mask,
                 target_idx=target_idx,
@@ -592,10 +656,11 @@ class BEVTrajDecoder(nn.Module):
                 bev_feat=bev_feat,
                 ego_dyn=ego_dyn,
                 tc_dyn=tc_dyn,
+                scene_context=scene_context_tokens,
                 dense_future_pred=dense_future_pred,
                 obj_valid_mask=obj_valid_mask,
                 target_idx=target_idx,
-                motion_cls_head=self.motion_cls,
+                mode_prob_head=self.mode_prob_head,
             )
 
             pred_traj = pred_traj.permute(0, 2, 1, 3).contiguous()
