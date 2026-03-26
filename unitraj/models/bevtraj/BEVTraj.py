@@ -136,9 +136,9 @@ class BEVTraj(BaseModel):
         last_prob = F.softmax(last_logit, dim=-1)
         last_traj = output['predicted_trajectory'][-1].permute(2, 0, 1, 3)
 
-        goal_candidate = output['goal_pos']
+        # Visualization should receive the same top-k mode ordering as the selected trajectories.
+        goal_candidate = output['goal_candidate_topk'].permute(1, 0, 2)
         # goal_candidate = output['goal_reg_list'][-1] # (K, B, 2)
-        # goal_candidate = output['goal_candidate_topk'].permute(1, 0, 2)
         # goal_candidate = output['goal_candidate'].permute(1, 0, 2) # (B, K, 2) -> (K, B, 2)
         # goal_candidate = output['predicted_goal_reg']
         
