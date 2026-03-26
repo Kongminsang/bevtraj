@@ -4,7 +4,6 @@ import pickle
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from unitraj.models.bevtraj.bev_deformable_aggregation import BDA_DEC
 from unitraj.models.bevtraj.decoder_deform_attn import BEVDeformCrossAttn
@@ -179,12 +178,7 @@ class BEVTrajDecoder(nn.Module):
         
         # ============================ Goal Candidate Proposal==========================
 
-        # classification
         self.bda_sgcp = BDA_DEC(self.config['bda_dec'], self.D)
-        self.goal_pos_enc = MLP(self.D, self.D, self.D, 2)
-        self.goal_score_fuse = MLP(self.D + self.D, self.D, self.D, 3)
-        self.goal_prob = MLP(self.D, self.D, 1, 2)
-        # self.goal_FDE = MLP(self.D, self.D, 1, 2)
 
         # regression
         self.goal_proposal = []
@@ -202,8 +196,6 @@ class BEVTrajDecoder(nn.Module):
 
         self.get_query_scale_sgcp = MLP(self.D, self.query_scale_dims, self.query_scale_dims, 2)
         self.goal_reg = MLP(self.D, self.D, 2, 2)
-        # self.goal_FDE = MLP(self.D, self.D, 1, 2)
-        self.goal_prob_reg = MLP(self.D, self.D, 1, 2)
 
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
 
@@ -284,27 +276,11 @@ class BEVTrajDecoder(nn.Module):
         return self.time_emb_alpha * pe
 
     def goal_candidate_proposal(self, bev_feat, ec_dyn, tc_dyn, ego_dyn):
-
-        # =============================== classification ===============================
-
-        bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
-
-        B, _, D = bda_token.shape
-
-        goal_pos_embed = gen_sineembed_for_position(
-            bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
-        )
-        goal_score_feat = self.goal_score_fuse(
-            torch.cat([bda_token, self.goal_pos_enc(goal_pos_embed)], dim=-1)
-        )
-        goal_logit = self.goal_prob(goal_score_feat).squeeze(-1)
-        goal_prob  = F.softmax(goal_logit, dim=-1)
+        bda_token, anchor_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
 
         mode_query = bda_token.permute(1, 0, 2).contiguous()
-        goal_pos = bda_pos
 
-        # return mode_query, goal_prob, bda_pos, goal_reg_list, goal_FDE_list
-        return mode_query, bda_pos, goal_pos, goal_prob
+        return mode_query, anchor_pos
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
@@ -484,7 +460,7 @@ class BEVTrajDecoder(nn.Module):
         mode_query,
         scene_context,
         bev_feat,
-        goal_candidate,
+        anchor_pos,
         ego_dyn,
         tc_dyn,
         scene_context_tokens=None,
@@ -510,9 +486,8 @@ class BEVTrajDecoder(nn.Module):
             ego_dyn['ego_cos'],
         )
 
-        # goal_candidate = goal_candidate.permute(1, 0, 2).contiguous()
-        goal_candidate = target_to_ego(
-            goal_candidate, trans_x, trans_y, rot_sin, rot_cos
+        anchor_pos = target_to_ego(
+            anchor_pos, trans_x, trans_y, rot_sin, rot_cos
         ).permute(1, 0, 2)  # [M, B, 2] (ego coord for BEV cross-attn)
 
         mode_embed = self.norm_l1[1](
@@ -520,7 +495,7 @@ class BEVTrajDecoder(nn.Module):
                 dec_embed=mode_embed,
                 bev_feat=bev_feat,
                 query_scale=query_scale,
-                ref_points=goal_candidate,
+                ref_points=anchor_pos,
             )
         )
         mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))  # [M,B,D]
@@ -582,11 +557,11 @@ class BEVTrajDecoder(nn.Module):
         scene_context = scene_context.permute(1, 0, 2)
 
         # -------------------Goal Candidate Proposal -----------------
-        mode_query, bda_pos, goal_pos, goal_prob = \
+        mode_query, anchor_pos = \
             self.goal_candidate_proposal(
                 bev_feat, ec_dyn, tc_dyn, ego_dyn
             )
-        goal_candidate = goal_pos.detach()
+        anchor_pos_detached = anchor_pos.detach()
 
         dense_future_pred = kwargs.get('dense_future_pred')
         obj_valid_mask = kwargs.get('obj_valid_mask')
@@ -598,7 +573,7 @@ class BEVTrajDecoder(nn.Module):
                 mode_query,
                 scene_context,
                 bev_feat,
-                goal_candidate,
+                anchor_pos_detached,
                 ego_dyn,
                 tc_dyn,
                 scene_context_tokens=scene_context_tokens,
@@ -606,17 +581,17 @@ class BEVTrajDecoder(nn.Module):
                 obj_valid_mask=obj_valid_mask,
                 target_idx=target_idx,
             )
-            # self.initial_prediction(mode_query, scene_context, bev_feat, bda_pos, ego_dyn)
+            # self.initial_prediction(mode_query, scene_context, bev_feat, anchor_pos, ego_dyn)
         
         mode_probs = [init_mode_prob]
         pred_trajs = [init_pred_traj.permute(0, 2, 1, 3)]
         pred_vels = [init_pred_vel.permute(0, 2, 1, 3)]
 
         top_idx = torch.topk(init_mode_prob, k=self.K, dim=-1).indices
-        goal_candidate_topk = torch.gather(
-            goal_candidate,
+        anchor_pos_topk = torch.gather(
+            anchor_pos_detached,
             dim=1,
-            index=top_idx.unsqueeze(-1).expand(-1, -1, goal_candidate.size(-1)),
+            index=top_idx.unsqueeze(-1).expand(-1, -1, anchor_pos_detached.size(-1)),
         )
         dec_embed = self.select_topk_modes(dec_embed, top_idx)
         init_pred_traj = self.select_topk_modes(init_pred_traj, top_idx)
@@ -674,10 +649,8 @@ class BEVTrajDecoder(nn.Module):
         output = {'predicted_probability': mode_probs,
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
-                  'anchor_pos' : bda_pos,
-                  'goal_pos' : goal_pos,
-                  'goal_prob' : goal_prob,
-                  'goal_candidate_topk': goal_candidate_topk,  # [B, K, 2]
+                  'anchor_pos' : anchor_pos,
+                  'anchor_pos_topk': anchor_pos_topk,  # [B, K, 2]
                 #   'init_top_idx': init_top_idx,                # [B, K]
                   'state_pred': state_pred, # [B, T, 2]
                 #   'goal_FDE_list': goal_FDE_list,

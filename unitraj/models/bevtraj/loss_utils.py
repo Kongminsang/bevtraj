@@ -18,8 +18,6 @@ class Criterion(nn.Module):
         pred_vels = out['predicted_velocity'] # [K, T, B, 2]
 
         anchor_pos = out['anchor_pos']
-        goal_pos = out['goal_pos']
-        goal_prob = out['goal_prob']
 
         dense_future_pred = out['dense_future_pred']
 
@@ -28,21 +26,14 @@ class Criterion(nn.Module):
         gt_decoder = gt[0]
         gt_dense_future_trajs = gt[1]
         
-        goal_candidate = (goal_pos, out.get('goal_candidate_topk'))
-        # goal_candidate = out['goal_reg_list'][-1].permute(1, 0, 2)
+        anchor_pos_set = (anchor_pos, out.get('anchor_pos_topk'))
+        # anchor_pos_set = out['goal_reg_list'][-1].permute(1, 0, 2)
         decoder_loss = self.get_decoder_loss_hard_assign(
             modes_preds=modes_preds,
             preds=preds,
             pred_vels=pred_vels,
-            goal_candidate=goal_candidate,
+            anchor_pos_set=anchor_pos_set,
             gt_decoder=gt_decoder,
-            center_gt_final_valid_idx=center_gt_final_valid_idx,
-        )
-
-        goal_prob_loss = self.get_goal_prob_loss(
-            goal_prob=goal_prob,
-            goal_anchor=anchor_pos,
-            gt=gt_decoder,
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
 
@@ -53,8 +44,7 @@ class Criterion(nn.Module):
 
         dense_future_loss = self.get_dense_future_prediction_loss(dense_future_pred, gt_dense_future_trajs)
 
-        # total_loss = decoder_loss + dense_future_loss + state_query_loss
-        total_loss = decoder_loss + goal_prob_loss + state_query_loss + dense_future_loss
+        total_loss = decoder_loss + state_query_loss + dense_future_loss
         return total_loss
 
     def get_decoder_loss_hard_assign( # EDA
@@ -62,16 +52,16 @@ class Criterion(nn.Module):
         modes_preds,                 # list of [B, K]
         preds,                       # list of [K, T, B, 5]
         pred_vels,                   # list of [K, T, B, 2]
-        goal_candidate,              # [goal_candidate_full[B,64,2], goal_candidate_topk[B,K,2]]
+        anchor_pos_set,              # [anchor_pos_full[B,64,2], anchor_pos_topk[B,K,2]]
         gt_decoder,                  # [B, T, 5] -> (x, y, vx, vy, valid)
         center_gt_final_valid_idx,   # [B]
     ):
-        if isinstance(goal_candidate, (tuple, list)):
-            goal_candidate_full = goal_candidate[0]
-            goal_candidate_topk = goal_candidate[1]
+        if isinstance(anchor_pos_set, (tuple, list)):
+            anchor_pos_full = anchor_pos_set[0]
+            anchor_pos_topk = anchor_pos_set[1]
         else:
-            goal_candidate_full = goal_candidate
-            goal_candidate_topk = None
+            anchor_pos_full = anchor_pos_set
+            anchor_pos_topk = None
 
         device = gt_decoder.device
         B = gt_decoder.size(0)
@@ -84,9 +74,9 @@ class Criterion(nn.Module):
         gt_goal = gt_xy[b_idx, final_idx]               # [B, 2]
         valid_final = gt_mask[b_idx, final_idx]         # [B]
 
-        # initial positive idx from SGCP goal candidate (full set)
+        # initial positive idx from SGCP anchors (full set)
         with torch.no_grad():
-            dist = (goal_candidate_full.detach() - gt_goal[:, None, :]).norm(dim=-1)  # [B, 64]
+            dist = (anchor_pos_full.detach() - gt_goal[:, None, :]).norm(dim=-1)  # [B, 64]
             hard_idx = dist.argmin(dim=-1)                                             # [B]
 
         w_cls = self.config.get('cls_weight', 2.0)
@@ -117,16 +107,16 @@ class Criterion(nn.Module):
             # ---------- Evolving Anchors ----------
             positive_layer_idx = (layer_idx // num_inter_layers) * num_inter_layers - 1
             if positive_layer_idx < 0:
-                # first-stage anchor from SGCP goal candidates
-                if pred_scores.size(1) == goal_candidate_full.size(1):
-                    cur_goal_candidate = goal_candidate_full
-                elif goal_candidate_topk is not None and pred_scores.size(1) == goal_candidate_topk.size(1):
-                    cur_goal_candidate = goal_candidate_topk
+                # first-stage anchor from SGCP anchors
+                if pred_scores.size(1) == anchor_pos_full.size(1):
+                    cur_anchor_pos = anchor_pos_full
+                elif anchor_pos_topk is not None and pred_scores.size(1) == anchor_pos_topk.size(1):
+                    cur_anchor_pos = anchor_pos_topk
                 else:
-                    cur_goal_candidate = goal_candidate_full[:, :pred_scores.size(1)]
+                    cur_anchor_pos = anchor_pos_full[:, :pred_scores.size(1)]
 
-                anchor_trajs = cur_goal_candidate.detach().unsqueeze(2)
-                dist = (cur_goal_candidate.detach() - gt_goal[:, None, :]).norm(dim=-1)
+                anchor_trajs = cur_anchor_pos.detach().unsqueeze(2)
+                dist = (cur_anchor_pos.detach() - gt_goal[:, None, :]).norm(dim=-1)
             else:
                 # use previous anchor trajectories
                 anchor_trajs = preds[positive_layer_idx].permute(2, 0, 1, 3).detach()  # [B, K, T, 5]
@@ -194,49 +184,6 @@ class Criterion(nn.Module):
 
         return total / num_layers
     
-    def get_goal_prob_loss(
-        self,
-        goal_prob,
-        goal_anchor,
-        gt,
-        center_gt_final_valid_idx,
-    ):
-        eps = 1e-9
-        entropy_weight = self.config.get('entropy_weight', 0.3)
-        kl_weight = self.config.get('kl_weight', 1.0)
-        sigma = self.config.get('goal_prob_sigma', 2.0)
-
-        B, N = goal_prob.shape
-        device = goal_prob.device
-        b_idx = torch.arange(B, device=device)
-
-        gt_goal = gt[b_idx, center_gt_final_valid_idx.long(), :2]             # [B, 2]
-        valid_final = gt[b_idx, center_gt_final_valid_idx.long(), -1].float() # [B]
-
-        sq_dist = ((goal_anchor - gt_goal.unsqueeze(1)) ** 2).sum(dim=-1)     # [B, N]
-        log_lik = -0.5 * sq_dist / (sigma ** 2)                                # [B, N]
-
-        prior = goal_prob.clamp_min(eps)                                       # [B, N]
-        log_prior = torch.log(prior)                                           # [B, N]
-
-        log_post_unnorm = log_lik + log_prior
-        log_post = log_post_unnorm - torch.logsumexp(log_post_unnorm, dim=-1, keepdim=True)
-        post_pr = torch.exp(log_post)                                          # [B, N]
-
-        denom = valid_final.sum().clamp_min(1.0)
-
-        nll = ((-log_lik) * post_pr).sum(dim=-1)                               # [B]
-        nll = (nll * valid_final).sum() / denom
-
-        post_entropy = -(post_pr * torch.log(post_pr.clamp_min(eps))).sum(dim=-1)  # [B]
-        post_entropy = (post_entropy * valid_final).sum() / denom
-
-        # sample-wise KL(post || prior): [B]
-        kl_per_sample = (post_pr * (log_post - log_prior)).sum(dim=-1)
-        kl_loss = (kl_per_sample * valid_final).sum() / denom
-
-        return nll + entropy_weight * post_entropy + kl_weight * kl_loss
-
     def get_goal_prediction_loss(self, goal_reg_list, gt, center_gt_final_valid_idx):
         """
         goal_reg: each [K, B, 2]

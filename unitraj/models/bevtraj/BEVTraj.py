@@ -137,15 +137,12 @@ class BEVTraj(BaseModel):
         last_traj = output['predicted_trajectory'][-1].permute(2, 0, 1, 3)
 
         # Visualization should receive the same top-k mode ordering as the selected trajectories.
-        goal_candidate = output['goal_candidate_topk'].permute(1, 0, 2)
-        # goal_candidate = output['goal_reg_list'][-1] # (K, B, 2)
-        # goal_candidate = output['goal_candidate'].permute(1, 0, 2) # (B, K, 2) -> (K, B, 2)
-        # goal_candidate = output['predicted_goal_reg']
+        anchor_pos_topk = output['anchor_pos_topk'].permute(1, 0, 2)
         
         prediction = {'predicted_probability': last_prob,
                       'predicted_trajectory': last_traj,
                       'dense_future_pred': dense_future_pred,
-                      'goal_reg': goal_candidate}
+                      'goal_reg': anchor_pos_topk}
         
         return prediction, loss
 
