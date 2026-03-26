@@ -196,6 +196,8 @@ class BEVTrajDecoder(nn.Module):
         self.traj_motion_proj = MLP(11, self.D, self.D, 2)
         self.traj_history_proj = MLP(self.target_attr, self.D, self.D, 2)
         self.traj_history_attn = nn.MultiheadAttention(self.D, self.num_heads, dropout=self.dropout)
+        self.traj_bev_query_scale = MLP(self.D, self.query_scale_dims, self.query_scale_dims, 2)
+        self.traj_bev_cross_attn = BEVDeformCrossAttn(**self.dca_itr_cfg)
         self.traj_bev_proj = MLP(self.D, self.D, self.D, 2)
         self.traj_interaction_proj = MLP(6, self.D, self.D, 2)
         self.traj_score_fuse = MLP(self.D * 4, self.D, self.D, 2)
@@ -293,7 +295,7 @@ class BEVTrajDecoder(nn.Module):
         )
         return self.traj_motion_proj(traj_feat)
 
-    def sample_traj_bev_tokens(self, pred_xy, bev_feat, ego_dyn):
+    def sample_traj_bev_tokens(self, traj_query, pred_xy, bev_feat, ego_dyn):
         M, B, T, _ = pred_xy.shape
         trans_x, trans_y, rot_sin, rot_cos = (
             ego_dyn['ego_x'],
@@ -304,22 +306,16 @@ class BEVTrajDecoder(nn.Module):
 
         pred_xy_flat = pred_xy.permute(1, 0, 2, 3).reshape(B, M * T, 2)
         pred_xy_ego = target_to_ego(pred_xy_flat, trans_x, trans_y, rot_sin, rot_cos)
-        pred_xy_ego = pred_xy_ego.reshape(B, M, T, 2)
+        pred_xy_ego = pred_xy_ego.reshape(B, M, T, 2).permute(1, 0, 2, 3).contiguous()
 
-        grid = pred_xy_ego / self.denorm_scale[None, None, None, :]
-        grid = grid.clone()
-        grid[..., 1] = -grid[..., 1]
-        grid = grid.reshape(B, M * T, 1, 2)
-
-        bev_samples = F.grid_sample(
-            bev_feat,
-            grid,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=False,
+        bev_tokens = self.traj_bev_cross_attn(
+            dec_embed=traj_query,
+            bev_feat=bev_feat,
+            query_scale=self.traj_bev_query_scale(traj_query),
+            ref_points=pred_xy_ego,
+            identity=torch.zeros_like(traj_query),
         )
-        bev_samples = bev_samples.squeeze(-1).permute(0, 2, 1).reshape(B, M, T, self.D)
-        return self.traj_bev_proj(bev_samples.permute(1, 0, 2, 3).contiguous())
+        return self.traj_bev_proj(bev_tokens)
 
     def build_dynamic_context(self, traj_query, tc_dyn):
         M, B, T, D = traj_query.shape
@@ -395,7 +391,7 @@ class BEVTrajDecoder(nn.Module):
         traj_query = dec_embed + motion_tokens
 
         dyn_tokens = self.build_dynamic_context(traj_query, tc_dyn)
-        bev_tokens = self.sample_traj_bev_tokens(pred_xy, bev_feat, ego_dyn)
+        bev_tokens = self.sample_traj_bev_tokens(traj_query, pred_xy, bev_feat, ego_dyn)
         interaction_tokens = self.build_interaction_tokens(
             pred_xy,
             pred_vel,
