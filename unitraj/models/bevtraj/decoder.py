@@ -56,6 +56,7 @@ class BEVTrajDecoderLayer(nn.Module):
             ref_points: [K, B, T, 2]
         '''
         B = bev_feat.size(0)
+        num_modes = ref_points.size(0)
         scene_context = scene_context 
         
         # ============================== target-centric(tc) modeling ==============================
@@ -70,10 +71,15 @@ class BEVTrajDecoderLayer(nn.Module):
         query_sine_embed = gen_sineembed_for_position(ref_points, hidden_dim=self.Q_D, temperature=self.spa_pos_T)
         tc_pos_Q = self.to_pos_Q(query_sine_embed)
         
-        dec_embed, query_scale = map(lambda t: t.reshape(self.T, B, self.K, -1).permute(2, 1, 0, 3), (dec_embed, query_scale))
+        dec_embed, query_scale = map(
+            lambda t: t.reshape(self.T, B, num_modes, -1).permute(2, 1, 0, 3),
+            (dec_embed, query_scale),
+        )
         dec_embed = dec_embed + tc_pos_Q
-        dec_embed = self.transformer_decoder_layer(tgt=dec_embed.reshape(self.K, B * self.T, -1),
-                                                   memory=scene_context).reshape(self.K, B, self.T, -1)
+        dec_embed = self.transformer_decoder_layer(
+            tgt=dec_embed.reshape(num_modes, B * self.T, -1),
+            memory=scene_context,
+        ).reshape(num_modes, B, self.T, -1)
         
         # ============================== ego-centric(ec) modeling ==============================
         trans_x, trans_y, rot_sin, rot_cos = (
@@ -82,21 +88,21 @@ class BEVTrajDecoderLayer(nn.Module):
             ego_dyn['ego_sin'],
             ego_dyn['ego_cos'],
         )
-        ref_points_flat = ref_points.permute(1, 0, 2, 3).reshape(B, self.K * self.T, 2)
+        ref_points_flat = ref_points.permute(1, 0, 2, 3).reshape(B, num_modes * self.T, 2)
         ref_points_flat = target_to_ego(ref_points_flat, trans_x, trans_y, rot_sin, rot_cos)
-        ref_points = ref_points_flat.reshape(B, self.K, self.T, 2).permute(1, 0, 2, 3)
+        ref_points = ref_points_flat.reshape(B, num_modes, self.T, 2).permute(1, 0, 2, 3)
         
         # cross attn with bev feature
         dec_embed = self.norm[1](self.bev_cross_attn(dec_embed, bev_feat, query_scale, ref_points))
 
         # 5) hybrid self-attn on K*T tokens
-        hybrid_tokens = dec_embed.permute(0, 2, 1, 3).reshape(self.K * self.T, B, self.D)  # [K*T,B,D]
+        hybrid_tokens = dec_embed.permute(0, 2, 1, 3).reshape(num_modes * self.T, B, self.D)  # [K*T,B,D]
         hybrid_out = self.hybrid_self_attn(
             query=hybrid_tokens, key=hybrid_tokens, value=hybrid_tokens
         )[0]
         hybrid_tokens = self.norm[2](hybrid_out + hybrid_tokens)
         # restore [K,B,T,D]
-        dec_embed = hybrid_tokens.reshape(self.K, self.T, B, self.D).permute(0, 2, 1, 3).contiguous()
+        dec_embed = hybrid_tokens.reshape(num_modes, self.T, B, self.D).permute(0, 2, 1, 3).contiguous()
         # =================
 
         dec_embed = self.norm[2](self.ffn(dec_embed))
@@ -442,19 +448,6 @@ class BEVTrajDecoder(nn.Module):
         fused = self.traj_score_ffn(fused)
         return mode_prob_head(fused).squeeze(dim=-1).T
 
-    def select_topk_modes(self, tensor, top_idx):
-        if tensor.dim() == 4:
-            tensor_b = tensor.permute(1, 0, 2, 3).contiguous()
-            gather_idx = top_idx[:, :, None, None].expand(-1, -1, tensor.size(2), tensor.size(3))
-            return torch.gather(tensor_b, dim=1, index=gather_idx).permute(1, 0, 2, 3).contiguous()
-
-        if tensor.dim() == 3:
-            tensor_b = tensor.permute(1, 0, 2).contiguous()
-            gather_idx = top_idx[:, :, None].expand(-1, -1, tensor.size(2))
-            return torch.gather(tensor_b, dim=1, index=gather_idx).permute(1, 0, 2).contiguous()
-
-        raise ValueError(f'Unsupported tensor rank for top-k mode selection: {tensor.dim()}')
-
     def initial_prediction(
         self,
         mode_query,
@@ -587,24 +580,16 @@ class BEVTrajDecoder(nn.Module):
         pred_trajs = [init_pred_traj.permute(0, 2, 1, 3)]
         pred_vels = [init_pred_vel.permute(0, 2, 1, 3)]
 
-        top_idx = torch.topk(init_mode_prob, k=self.K, dim=-1).indices
-        anchor_pos_topk = torch.gather(
-            anchor_pos_detached,
-            dim=1,
-            index=top_idx.unsqueeze(-1).expand(-1, -1, anchor_pos_detached.size(-1)),
-        )
-        dec_embed = self.select_topk_modes(dec_embed, top_idx)
-        init_pred_traj = self.select_topk_modes(init_pred_traj, top_idx)
-        init_pred_vel = self.select_topk_modes(init_pred_vel, top_idx)
         ref_points = init_pred_traj[..., :2].detach().clone()
-        
-        dec_embed = dec_embed.permute(2, 1, 0, 3).reshape(self.T, B * self.K, -1)
+        num_modes = ref_points.size(0)
+
+        dec_embed = dec_embed.permute(2, 1, 0, 3).reshape(self.T, B * num_modes, -1)
 
         # exp: sample-conditioned deterministic code
         # dec_embed = self.temp_pos_enc(dec_embed)
 
         # exp: temporal PE (time_embedding_mlp)
-        time_pe = self.build_time_pe(B, self.K, dec_embed.dtype)
+        time_pe = self.build_time_pe(B, num_modes, dec_embed.dtype)
 
         for lid, layer in enumerate(self.dec_layers):
             query_scale = self.get_query_scale_itr(dec_embed)
@@ -644,13 +629,12 @@ class BEVTrajDecoder(nn.Module):
             pred_trajs.append(pred_traj)
             pred_vels.append(pred_vel)
             
-            dec_embed = dec_embed.permute(2, 1, 0, 3).reshape(self.T, B*self.K, -1)
+            dec_embed = dec_embed.permute(2, 1, 0, 3).reshape(self.T, B * num_modes, -1)
             
         output = {'predicted_probability': mode_probs,
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
                   'anchor_pos' : anchor_pos,
-                  'anchor_pos_topk': anchor_pos_topk,  # [B, K, 2]
                 #   'init_top_idx': init_top_idx,                # [B, K]
                   'state_pred': state_pred, # [B, T, 2]
                 #   'goal_FDE_list': goal_FDE_list,

@@ -136,13 +136,17 @@ class BEVTraj(BaseModel):
         last_prob = F.softmax(last_logit, dim=-1)
         last_traj = output['predicted_trajectory'][-1].permute(2, 0, 1, 3)
 
-        # Visualization should receive the same top-k mode ordering as the selected trajectories.
-        anchor_pos_topk = output['anchor_pos_topk'].permute(1, 0, 2)
+        anchor_pos = output['anchor_pos']
+        goal_reg = anchor_pos.permute(1, 0, 2).contiguous()
+        if is_validation:
+            last_traj, last_prob, ret_idxs = batch_nms(last_traj, last_prob, dist_thresh=2.5, num_ret_modes=10)
+            batch_idx = torch.arange(B, device=ret_idxs.device)[:, None]
+            goal_reg = anchor_pos[batch_idx, ret_idxs].permute(1, 0, 2).contiguous()
         
         prediction = {'predicted_probability': last_prob,
                       'predicted_trajectory': last_traj,
                       'dense_future_pred': dense_future_pred,
-                      'goal_reg': anchor_pos_topk}
+                      'goal_reg': goal_reg}
         
         return prediction, loss
 

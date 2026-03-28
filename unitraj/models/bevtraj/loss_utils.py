@@ -26,13 +26,11 @@ class Criterion(nn.Module):
         gt_decoder = gt[0]
         gt_dense_future_trajs = gt[1]
         
-        anchor_pos_set = (anchor_pos, out.get('anchor_pos_topk'))
-        # anchor_pos_set = out['goal_reg_list'][-1].permute(1, 0, 2)
         decoder_loss = self.get_decoder_loss_hard_assign(
             modes_preds=modes_preds,
             preds=preds,
             pred_vels=pred_vels,
-            anchor_pos_set=anchor_pos_set,
+            anchor_pos=anchor_pos,
             gt_decoder=gt_decoder,
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
@@ -52,17 +50,10 @@ class Criterion(nn.Module):
         modes_preds,                 # list of [B, K]
         preds,                       # list of [K, T, B, 5]
         pred_vels,                   # list of [K, T, B, 2]
-        anchor_pos_set,              # [anchor_pos_full[B,64,2], anchor_pos_topk[B,K,2]]
+        anchor_pos,                  # [B, K, 2]
         gt_decoder,                  # [B, T, 5] -> (x, y, vx, vy, valid)
         center_gt_final_valid_idx,   # [B]
     ):
-        if isinstance(anchor_pos_set, (tuple, list)):
-            anchor_pos_full = anchor_pos_set[0]
-            anchor_pos_topk = anchor_pos_set[1]
-        else:
-            anchor_pos_full = anchor_pos_set
-            anchor_pos_topk = None
-
         device = gt_decoder.device
         B = gt_decoder.size(0)
         b_idx = torch.arange(B, device=device)
@@ -76,7 +67,7 @@ class Criterion(nn.Module):
 
         # initial positive idx from SGCP anchors (full set)
         with torch.no_grad():
-            dist = (anchor_pos_full.detach() - gt_goal[:, None, :]).norm(dim=-1)  # [B, 64]
+            dist = (anchor_pos.detach() - gt_goal[:, None, :]).norm(dim=-1)  # [B, K]
             hard_idx = dist.argmin(dim=-1)                                             # [B]
 
         w_cls = self.config.get('cls_weight', 2.0)
@@ -108,12 +99,7 @@ class Criterion(nn.Module):
             positive_layer_idx = (layer_idx // num_inter_layers) * num_inter_layers - 1
             if positive_layer_idx < 0:
                 # first-stage anchor from SGCP anchors
-                if pred_scores.size(1) == anchor_pos_full.size(1):
-                    cur_anchor_pos = anchor_pos_full
-                elif anchor_pos_topk is not None and pred_scores.size(1) == anchor_pos_topk.size(1):
-                    cur_anchor_pos = anchor_pos_topk
-                else:
-                    cur_anchor_pos = anchor_pos_full[:, :pred_scores.size(1)]
+                cur_anchor_pos = anchor_pos[:, :pred_scores.size(1)]
 
                 anchor_trajs = cur_anchor_pos.detach().unsqueeze(2)
                 dist = (cur_anchor_pos.detach() - gt_goal[:, None, :]).norm(dim=-1)
