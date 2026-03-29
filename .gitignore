@@ -19,6 +19,7 @@ UniTraj.egg-info/
 mmdet3d.egg-info/
 bevtraj.egg-info/
 .vscode/
+.codex
 tmp/
 wandb/
 
