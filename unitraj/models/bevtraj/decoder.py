@@ -4,6 +4,7 @@ import pickle
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from unitraj.models.bevtraj.bev_deformable_aggregation import BDA_DEC
 from unitraj.models.bevtraj.decoder_deform_attn import BEVDeformCrossAttn
@@ -96,13 +97,13 @@ class BEVTrajDecoderLayer(nn.Module):
         dec_embed = self.norm[1](self.bev_cross_attn(dec_embed, bev_feat, query_scale, ref_points))
 
         # 5) hybrid self-attn on K*T tokens
-        # hybrid_tokens = dec_embed.permute(0, 2, 1, 3).reshape(num_modes * self.T, B, self.D)  # [K*T,B,D]
-        # hybrid_out = self.hybrid_self_attn(
-        #     query=hybrid_tokens, key=hybrid_tokens, value=hybrid_tokens
-        # )[0]
-        # hybrid_tokens = self.norm[2](hybrid_out + hybrid_tokens)
-        # # restore [K,B,T,D]
-        # dec_embed = hybrid_tokens.reshape(num_modes, self.T, B, self.D).permute(0, 2, 1, 3).contiguous()
+        hybrid_tokens = dec_embed.permute(0, 2, 1, 3).reshape(num_modes * self.T, B, self.D)  # [K*T,B,D]
+        hybrid_out = self.hybrid_self_attn(
+            query=hybrid_tokens, key=hybrid_tokens, value=hybrid_tokens
+        )[0]
+        hybrid_tokens = self.norm[2](hybrid_out + hybrid_tokens)
+        # restore [K,B,T,D]
+        dec_embed = hybrid_tokens.reshape(num_modes, self.T, B, self.D).permute(0, 2, 1, 3).contiguous()
         # =================
 
         dec_embed = self.norm[2](self.ffn(dec_embed))
@@ -141,6 +142,96 @@ class TemporalModeCompressor(nn.Module):
         return self.ffn(fused)
 
 
+class CheapTrajectoryScorer(nn.Module):
+    def __init__(self, dim, ffn_dim, dropout, grid_size, future_len, num_points=8, bev_dim=64):
+        super().__init__()
+        self.dim = dim
+        self.future_len = future_len
+        self.num_points = min(int(num_points), future_len)
+        self.bev_dim = int(bev_dim)
+
+        num_groups = 8 if self.bev_dim % 8 == 0 else 1
+        self.bev_reduce = nn.Sequential(
+            nn.Conv2d(dim, self.bev_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=self.bev_dim),
+            nn.ReLU(),
+        )
+
+        self.query_proj = MLP(dim * 3, dim, dim, 2)
+        self.query_norm = nn.LayerNorm(dim)
+
+        self.query_step_proj = MLP(dim, self.bev_dim, self.bev_dim, 2)
+        self.bev_token_proj = MLP(self.bev_dim, self.bev_dim, self.bev_dim, 2)
+        self.bev_step_fuse = MLP(self.bev_dim * 2, self.bev_dim, self.bev_dim, 2)
+        self.bev_temporal_proj = MLP(self.bev_dim * 3, self.bev_dim, self.bev_dim, 2)
+        self.bev_norm = nn.LayerNorm(self.bev_dim)
+
+        self.fuse = MLP(dim + self.bev_dim, dim, dim, 2)
+        self.fuse_norm = nn.LayerNorm(dim)
+        self.ffn = FFN(dim, ffn_dim, 2, dropout=dropout)
+        self.out_head = MLP(dim, dim, 1, 2)
+
+        time_idx = torch.linspace(0, future_len - 1, steps=self.num_points).round().long()
+        self.register_buffer('sparse_time_idx', time_idx)
+        self.register_buffer('denorm_scale', torch.tensor(grid_size, dtype=torch.float32))
+
+    def project_bev(self, bev_feat):
+        return self.bev_reduce(bev_feat)
+
+    def sample_bev_tokens(self, pred_xy, bev_feat, ego_dyn):
+        M, B, _, _ = pred_xy.shape
+        trans_x, trans_y, rot_sin, rot_cos = (
+            ego_dyn['ego_x'],
+            ego_dyn['ego_y'],
+            ego_dyn['ego_sin'],
+            ego_dyn['ego_cos'],
+        )
+
+        pred_xy_sparse = pred_xy.index_select(2, self.sparse_time_idx).detach()
+        pred_xy_flat = pred_xy_sparse.permute(1, 0, 2, 3).reshape(B, M * self.num_points, 2)
+        pred_xy_ego = target_to_ego(pred_xy_flat, trans_x, trans_y, rot_sin, rot_cos)
+        grid = pred_xy_ego / self.denorm_scale[None, None, :]
+        grid = grid.reshape(B, M * self.num_points, 1, 2)
+        grid[..., 1] = -grid[..., 1]
+
+        sampled = F.grid_sample(
+            bev_feat,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        )
+        sampled = sampled.reshape(B, self.bev_dim, M, self.num_points).permute(2, 0, 3, 1).contiguous()
+        return sampled
+
+    def aggregate_bev_tokens(self, bev_tokens, traj_query):
+        query_sparse = traj_query.index_select(2, self.sparse_time_idx)
+        query_sparse = self.query_step_proj(query_sparse)
+
+        bev_tokens = self.bev_token_proj(bev_tokens)
+        bev_tokens = self.bev_step_fuse(torch.cat([bev_tokens, query_sparse], dim=-1))
+
+        mean_bev = bev_tokens.mean(dim=2)
+        last_bev = bev_tokens[:, :, -1, :]
+        max_bev = bev_tokens.amax(dim=2)
+        bev_mode = self.bev_temporal_proj(torch.cat([mean_bev, last_bev, max_bev], dim=-1))
+        return self.bev_norm(bev_mode)
+
+    def forward(self, traj_query, pred_xy, bev_feat, ego_dyn):
+        mean_q = traj_query.mean(dim=2)
+        last_q = traj_query[:, :, -1, :]
+        max_q = traj_query.amax(dim=2)
+        query_mode = self.query_norm(self.query_proj(torch.cat([mean_q, last_q, max_q], dim=-1)))
+
+        bev_tokens = self.sample_bev_tokens(pred_xy, bev_feat, ego_dyn)
+        bev_mode = self.aggregate_bev_tokens(bev_tokens, traj_query)
+
+        fused = self.fuse(torch.cat([query_mode, bev_mode], dim=-1))
+        fused = self.fuse_norm(fused)
+        fused = self.ffn(fused)
+        return self.out_head(fused).squeeze(dim=-1).T
+
+
 class BEVTrajDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -163,6 +254,9 @@ class BEVTrajDecoder(nn.Module):
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
+        self.num_heavy_refinement_score_layers = int(
+            config.get('num_heavy_refinement_score_layers', 1)
+        )
         
         self.dca_cfg = config['deform_cross_attn']
         self.dca_cfg['dim'] = self.D
@@ -238,6 +332,15 @@ class BEVTrajDecoder(nn.Module):
         self.traj_score_fuse = MLP(self.D * 4, self.D, self.D, 2)
         self.traj_score_norm = nn.LayerNorm(self.D)
         self.traj_score_ffn = FFN(self.D, self.ffn_D, 2)
+        self.traj_score_cheap = CheapTrajectoryScorer(
+            self.D,
+            self.ffn_D,
+            self.dropout,
+            self.grid_size,
+            self.T,
+            num_points=config.get('cheap_scorer_num_points', 8),
+            bev_dim=config.get('cheap_scorer_dim', 64),
+        )
 
         # exp: DeMo-like ITP (state consistency branch)
         self.state_norm_l1 = nn.ModuleList([nn.LayerNorm(self.D) for _ in range(2)])
@@ -448,6 +551,12 @@ class BEVTrajDecoder(nn.Module):
         fused = self.traj_score_ffn(fused)
         return mode_prob_head(fused).squeeze(dim=-1).T
 
+    def score_predicted_trajectory_cheap(self, dec_embed, pred_traj, pred_vel, bev_feat, ego_dyn):
+        pred_xy = pred_traj[..., :2]
+        motion_tokens = self.build_traj_motion_tokens(pred_traj, pred_vel)
+        traj_query = dec_embed + motion_tokens
+        return self.traj_score_cheap(traj_query, pred_xy, bev_feat, ego_dyn)
+
     def initial_prediction(
         self,
         mode_query,
@@ -590,6 +699,7 @@ class BEVTrajDecoder(nn.Module):
 
         # exp: temporal PE (time_embedding_mlp)
         time_pe = self.build_time_pe(B, num_modes, dec_embed.dtype)
+        cheap_bev_feat = None
 
         for lid, layer in enumerate(self.dec_layers):
             query_scale = self.get_query_scale_itr(dec_embed)
@@ -609,19 +719,30 @@ class BEVTrajDecoder(nn.Module):
             ref_points = pred_xy.detach().clone()
 
             pred_vel = self.motion_vel(dec_embed) # [K, B, T, 2]
-            mode_prob = self.score_predicted_trajectory(
-                dec_embed=dec_embed,
-                pred_traj=pred_traj,
-                pred_vel=pred_vel,
-                bev_feat=bev_feat,
-                ego_dyn=ego_dyn,
-                tc_dyn=tc_dyn,
-                scene_context=scene_context_tokens,
-                dense_future_pred=dense_future_pred,
-                obj_valid_mask=obj_valid_mask,
-                target_idx=target_idx,
-                mode_prob_head=self.mode_prob_head,
-            )
+            if lid < self.num_heavy_refinement_score_layers:
+                mode_prob = self.score_predicted_trajectory(
+                    dec_embed=dec_embed,
+                    pred_traj=pred_traj,
+                    pred_vel=pred_vel,
+                    bev_feat=bev_feat,
+                    ego_dyn=ego_dyn,
+                    tc_dyn=tc_dyn,
+                    scene_context=scene_context_tokens,
+                    dense_future_pred=dense_future_pred,
+                    obj_valid_mask=obj_valid_mask,
+                    target_idx=target_idx,
+                    mode_prob_head=self.mode_prob_head,
+                )
+            else:
+                if cheap_bev_feat is None:
+                    cheap_bev_feat = self.traj_score_cheap.project_bev(bev_feat)
+                mode_prob = self.score_predicted_trajectory_cheap(
+                    dec_embed=dec_embed,
+                    pred_traj=pred_traj,
+                    pred_vel=pred_vel,
+                    bev_feat=cheap_bev_feat,
+                    ego_dyn=ego_dyn,
+                )
 
             pred_traj = pred_traj.permute(0, 2, 1, 3).contiguous()
             pred_vel = pred_vel.permute(0, 2, 1, 3).contiguous()
