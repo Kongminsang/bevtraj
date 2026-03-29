@@ -308,17 +308,17 @@ class BDA_DEC(BEVDeformableAggregation):
         ])
 
         # file_path = 'unitraj/models/bevtraj/cluster_256_center_dict_6s.pkl'
-        # file_path = 'unitraj/models/bevtraj/cluster_64_center_dict_6s.pkl'
-        file_path = 'unitraj/models/bevtraj/cluster_32_center_dict_6s.pkl'
+        file_path = 'unitraj/models/bevtraj/cluster_64_center_dict_6s.pkl'
+        # file_path = 'unitraj/models/bevtraj/cluster_32_center_dict_6s.pkl'
         with open(file_path, 'rb') as f:
             anchors = pickle.load(f)
         # self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
         self.anchors = nn.Parameter(torch.from_numpy(anchors['VEHICLE']).float())
 
-        # self.ba_query_dec = nn.Parameter(torch.zeros(64, self.D), requires_grad=True) # kong_fixme
-        # self.num_ba_query = 64
-        self.ba_query_dec = nn.Parameter(torch.zeros(32, self.D), requires_grad=True) # kong_fixme
-        self.num_ba_query = 32
+        self.ba_query_dec = nn.Parameter(torch.zeros(64, self.D), requires_grad=True) # kong_fixme
+        self.num_ba_query = 64
+        # self.ba_query_dec = nn.Parameter(torch.zeros(32, self.D), requires_grad=True) # kong_fixme
+        # self.num_ba_query = 32
 
     def build_anchor_relation_feat(self, ref_pos_target, tc_dyn):
         eps = 1e-3
