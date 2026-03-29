@@ -251,7 +251,8 @@ class Criterion(nn.Module):
                                                                                      min=1.0)
         loss_reg = loss_reg.mean()
 
-        return loss_reg
+        w = float(self.config.get('dense_future_weight', 0.5))
+        return w * loss_reg
     
     def nll_loss_gmm_direct(self, pred_scores, pred_trajs, gt_trajs, gt_valid_mask, pre_nearest_mode_idxs=None,
                             timestamp_loss_weight=None, use_square_gmm=False, log_std_range=(-1.609, 5.0), rho_limit=0.5):
