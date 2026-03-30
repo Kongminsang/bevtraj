@@ -97,13 +97,13 @@ class BEVTrajDecoderLayer(nn.Module):
         dec_embed = self.norm[1](self.bev_cross_attn(dec_embed, bev_feat, query_scale, ref_points))
 
         # 5) hybrid self-attn on K*T tokens
-        hybrid_tokens = dec_embed.permute(0, 2, 1, 3).reshape(num_modes * self.T, B, self.D)  # [K*T,B,D]
-        hybrid_out = self.hybrid_self_attn(
-            query=hybrid_tokens, key=hybrid_tokens, value=hybrid_tokens
-        )[0]
-        hybrid_tokens = self.norm[2](hybrid_out + hybrid_tokens)
-        # restore [K,B,T,D]
-        dec_embed = hybrid_tokens.reshape(num_modes, self.T, B, self.D).permute(0, 2, 1, 3).contiguous()
+        # hybrid_tokens = dec_embed.permute(0, 2, 1, 3).reshape(num_modes * self.T, B, self.D)  # [K*T,B,D]
+        # hybrid_out = self.hybrid_self_attn(
+        #     query=hybrid_tokens, key=hybrid_tokens, value=hybrid_tokens
+        # )[0]
+        # hybrid_tokens = self.norm[2](hybrid_out + hybrid_tokens)
+        # # restore [K,B,T,D]
+        # dec_embed = hybrid_tokens.reshape(num_modes, self.T, B, self.D).permute(0, 2, 1, 3).contiguous()
         # =================
 
         dec_embed = self.norm[2](self.ffn(dec_embed))
