@@ -11,6 +11,26 @@ class Criterion(nn.Module):
         self.config = config
 
         self.goal_FDE_loss = nn.SmoothL1Loss(reduction='mean', beta=1.0)
+        self.smoothness_dt = float(self.config.get('smoothness_dt', 0.1))
+        self.inv_smoothness_dt2 = 1.0 / (self.smoothness_dt ** 2)
+        self.inv_smoothness_dt3 = 1.0 / (self.smoothness_dt ** 3)
+
+    def get_trajectory_smoothness_loss(self, pred_xy, valid_mask):
+        valid_mask = valid_mask.to(pred_xy.dtype)
+
+        disp = pred_xy[:, 1:, :] - pred_xy[:, :-1, :]
+        accel = (disp[:, 1:, :] - disp[:, :-1, :]) * self.inv_smoothness_dt2
+
+        accel_valid = valid_mask[:, :-2] * valid_mask[:, 1:-1] * valid_mask[:, 2:]
+        loss_acc = (accel.square().sum(dim=-1) * accel_valid).sum()
+        loss_acc = loss_acc / accel_valid.sum().clamp_min(1.0)
+
+        jerk = (accel[:, 1:, :] - accel[:, :-1, :]) / self.smoothness_dt
+        jerk_valid = accel_valid[:, :-1] * accel_valid[:, 1:]
+        loss_jerk = (jerk.square().sum(dim=-1) * jerk_valid).sum()
+        loss_jerk = loss_jerk / jerk_valid.sum().clamp_min(1.0)
+
+        return loss_acc, loss_jerk
 
     def forward(self, out, gt, center_gt_final_valid_idx, traj_data):
         modes_preds = out['predicted_probability'] # [B, K]
@@ -76,6 +96,10 @@ class Criterion(nn.Module):
         w_cls_final = self.config.get('cls_weight_final', 2.0)
         w_reg_final = self.config.get('reg_weight_final', 1.0)
         w_vel_final = self.config.get('vel_weight_final', w_vel)
+        w_acc = float(self.config.get('acc_weight', 0.0))
+        w_jerk = float(self.config.get('jerk_weight', 0.0))
+        w_acc_final = float(self.config.get('acc_weight_final', w_acc))
+        w_jerk_final = float(self.config.get('jerk_weight_final', w_jerk))
 
         # EDA-related config
         num_inter_layers = int(self.config.get('num_inter_layers', 2))
@@ -90,6 +114,8 @@ class Criterion(nn.Module):
             cur_w_cls = w_cls_final if is_last_layer else w_cls
             cur_w_reg = w_reg_final if is_last_layer else w_reg
             cur_w_vel = w_vel_final if is_last_layer else w_vel
+            cur_w_acc = w_acc_final if is_last_layer else w_acc
+            cur_w_jerk = w_jerk_final if is_last_layer else w_jerk
 
             # pred: [K, T, B, 5] -> [B, K, T, 5]
             pred_trajs = pred.permute(2, 0, 1, 3).contiguous()
@@ -154,9 +180,11 @@ class Criterion(nn.Module):
                 use_square_gmm=False,
             )
 
+            pred_xy_pos = mu[b_idx, hard_idx]  # [B, T, 2]
             pred_vel_pos = pred_vel[b_idx, hard_idx]  # [B, T, 2]
             loss_reg_vel = F.l1_loss(pred_vel_pos, gt_vel, reduction='none')
             loss_reg_vel = (loss_reg_vel * gt_mask[:, :, None]).sum(dim=-1).sum(dim=-1)
+            loss_acc, loss_jerk = self.get_trajectory_smoothness_loss(pred_xy_pos, gt_mask)
 
             # ---------- BCE classification ----------
             bce_target = torch.zeros_like(pred_scores)   # [B, K]
@@ -166,6 +194,7 @@ class Criterion(nn.Module):
 
             layer_loss = cur_w_reg * loss_reg_gmm + cur_w_vel * loss_reg_vel + cur_w_cls * loss_cls
             layer_loss = (layer_loss * valid_final).sum() / valid_final.sum().clamp_min(1.0)
+            layer_loss = layer_loss + cur_w_acc * loss_acc + cur_w_jerk * loss_jerk
             total = total + layer_loss
 
         return total / num_layers
