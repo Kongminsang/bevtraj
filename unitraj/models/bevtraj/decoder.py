@@ -167,6 +167,12 @@ class BEVTrajDecoder(nn.Module):
         self.num_heavy_refinement_score_layers = int(
             config.get('num_heavy_refinement_score_layers', 1)
         )
+        self.score_time_stride_late_layers = int(
+            config.get('score_time_stride_late_layers', 1)
+        )
+        self.score_time_full_refine_layers = int(
+            config.get('score_time_full_refine_layers', 1)
+        )
         
         self.dca_cfg = config['deform_cross_attn']
         self.dca_cfg['dim'] = self.D
@@ -284,6 +290,12 @@ class BEVTrajDecoder(nn.Module):
         pe = pe.reshape(self.T, B * K, self.D)  # [T,BK,D]
 
         return self.time_emb_alpha * pe
+
+    def get_late_score_time_indices(self, device):
+        stride = self.score_time_stride_late_layers
+        if stride <= 1:
+            return None
+        return torch.arange(0, self.T, stride, device=device, dtype=torch.long)
 
     def goal_candidate_proposal(self, bev_feat, ec_dyn, tc_dyn, ego_dyn):
         bda_token, anchor_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
@@ -422,7 +434,15 @@ class BEVTrajDecoder(nn.Module):
         obj_valid_mask=None,
         target_idx=None,
         mode_prob_head=None,
+        time_indices=None,
     ):
+        if time_indices is not None:
+            dec_embed = dec_embed.index_select(2, time_indices)
+            pred_traj = pred_traj.index_select(2, time_indices)
+            pred_vel = pred_vel.index_select(2, time_indices)
+            if dense_future_pred is not None:
+                dense_future_pred = dense_future_pred.index_select(2, time_indices)
+
         pred_xy = pred_traj[..., :2]
         motion_tokens = self.build_traj_motion_tokens(pred_traj, pred_vel)
         traj_query = dec_embed + motion_tokens
@@ -600,7 +620,8 @@ class BEVTrajDecoder(nn.Module):
 
         # exp: temporal PE (time_embedding_mlp)
         time_pe = self.build_time_pe(B, num_modes, dec_embed.dtype)
-        for layer in self.dec_layers:
+        late_score_time_indices = self.get_late_score_time_indices(dec_embed.device)
+        for layer_idx, layer in enumerate(self.dec_layers):
             query_scale = self.get_query_scale_itr(dec_embed)
             dec_embed = layer(
                 dec_embed=dec_embed,
@@ -618,6 +639,9 @@ class BEVTrajDecoder(nn.Module):
             ref_points = pred_xy.detach().clone()
 
             pred_vel = self.motion_vel(dec_embed) # [K, B, T, 2]
+            score_time_indices = None
+            if layer_idx >= self.score_time_full_refine_layers:
+                score_time_indices = late_score_time_indices
             mode_prob = self.score_predicted_trajectory(
                 dec_embed=dec_embed,
                 pred_traj=pred_traj,
@@ -630,6 +654,7 @@ class BEVTrajDecoder(nn.Module):
                 obj_valid_mask=obj_valid_mask,
                 target_idx=target_idx,
                 mode_prob_head=self.mode_prob_head,
+                time_indices=score_time_indices,
             )
 
             pred_traj = pred_traj.permute(0, 2, 1, 3).contiguous()

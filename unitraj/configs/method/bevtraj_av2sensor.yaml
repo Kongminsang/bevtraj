@@ -203,6 +203,8 @@ MODEL:
         num_goal_proposal_layers: 2
         num_decoder_layers: 6
         num_heads: 16
+        score_time_stride_late_layers: 4
+        score_time_full_refine_layers: 1
 
         deform_cross_attn_key:
             dim_head: 64
