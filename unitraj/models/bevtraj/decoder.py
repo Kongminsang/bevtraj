@@ -41,9 +41,9 @@ class BEVTrajDecoderLayer(nn.Module):
         self.bev_cross_attn = BEVDeformCrossAttn(**config['deform_cross_attn'])
 
         # hybrid self-attn: token 길이를 K*T로 보고 attention
-        self.hybrid_self_attn = nn.MultiheadAttention(
-            self.D, self.num_heads, dropout=self.dropout
-        )
+        # self.hybrid_self_attn = nn.MultiheadAttention(
+        #     self.D, self.num_heads, dropout=self.dropout
+        # )
 
         self.ffn = FFN(self.D, self.ffn_D, 2)
     
@@ -584,7 +584,7 @@ class BEVTrajDecoder(nn.Module):
             self.goal_candidate_proposal(
                 bev_feat, ec_dyn, tc_dyn, ego_dyn
             )
-        anchor_pos_detached = anchor_pos.detach()
+        # anchor_pos_detached = anchor_pos.detach()
 
         dense_future_pred = kwargs.get('dense_future_pred')
         obj_valid_mask = kwargs.get('obj_valid_mask')
@@ -596,7 +596,7 @@ class BEVTrajDecoder(nn.Module):
                 mode_query,
                 scene_context,
                 bev_feat,
-                anchor_pos_detached,
+                anchor_pos,
                 ego_dyn,
                 tc_dyn,
                 scene_context_tokens=scene_context_tokens,
