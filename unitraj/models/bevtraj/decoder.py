@@ -584,7 +584,7 @@ class BEVTrajDecoder(nn.Module):
             self.goal_candidate_proposal(
                 bev_feat, ec_dyn, tc_dyn, ego_dyn
             )
-        # anchor_pos_detached = anchor_pos.detach()
+        anchor_pos_detached = anchor_pos.detach()
 
         dense_future_pred = kwargs.get('dense_future_pred')
         obj_valid_mask = kwargs.get('obj_valid_mask')
@@ -596,7 +596,7 @@ class BEVTrajDecoder(nn.Module):
                 mode_query,
                 scene_context,
                 bev_feat,
-                anchor_pos,
+                anchor_pos_detached,
                 ego_dyn,
                 tc_dyn,
                 scene_context_tokens=scene_context_tokens,

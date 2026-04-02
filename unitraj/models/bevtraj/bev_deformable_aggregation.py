@@ -312,8 +312,8 @@ class BDA_DEC(BEVDeformableAggregation):
         # file_path = 'unitraj/models/bevtraj/cluster_32_center_dict_6s.pkl'
         with open(file_path, 'rb') as f:
             anchors = pickle.load(f)
-        # self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
-        self.anchors = nn.Parameter(torch.from_numpy(anchors['VEHICLE']).float())
+        self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
+        # self.anchors = nn.Parameter(torch.from_numpy(anchors['VEHICLE']).float())
 
         self.ba_query_dec = nn.Parameter(torch.zeros(64, self.D), requires_grad=True) # kong_fixme
         self.num_ba_query = 64
