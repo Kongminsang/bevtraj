@@ -161,6 +161,9 @@ class BEVTrajDecoder(nn.Module):
         self.spa_pos_T = config['spa_pos_T']
         self.dropout = config['dropout']
         self.L_goal_proposal = config['num_goal_proposal_layers']
+        self.goal_attn_topk = int(config.get('goal_attn_topk', 8))
+        if self.goal_attn_topk <= 0:
+            raise ValueError('goal_attn_topk must be a positive integer')
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
@@ -321,22 +324,60 @@ class BEVTrajDecoder(nn.Module):
 
         learned_query = self.goal_query.expand(-1, B, -1)
         mode_query = learned_query
+        final_cross_attn = None
 
-        for layer in self.goal_proposal:
+        for layer_idx, layer in enumerate(self.goal_proposal):
             residual = mode_query
             mode_query = layer['norm1'](
                 layer['self_attn'](mode_query, mode_query, mode_query)[0] + residual
             )
 
             cross_query = torch.cat([mode_query, learned_query], dim=-1)
-            cross_query = layer['cross_attn'](cross_query, key, value)[0]
+            is_last_layer = layer_idx == len(self.goal_proposal) - 1
+            cross_query, cross_attn = layer['cross_attn'](
+                cross_query,
+                key,
+                value,
+                need_weights=is_last_layer,
+                average_attn_weights=True,
+            )
+            if is_last_layer:
+                final_cross_attn = cross_attn
             cross_query = layer['q_proj'](cross_query)
             mode_query = layer['norm2'](cross_query + mode_query)
             mode_query = layer['norm3'](layer['ffn'](mode_query))
 
+        if final_cross_attn is None:
+            raise RuntimeError('goal_proposal must contain at least one layer')
+
+        # final_cross_attn: [B, K, N_ref].  Associate each mode with a spatial
+        # point using only its strongest reference-point evidence.
+        if final_cross_attn.size(-1) == 0:
+            raise RuntimeError('goal cross attention received no reference points')
+        num_topk = min(self.goal_attn_topk, final_cross_attn.size(-1))
+        topk_weight, topk_idx = final_cross_attn.topk(num_topk, dim=-1)
+        num_modes = final_cross_attn.size(1)
+        candidate_pos = bda_pos[:, None, :, :].expand(-1, num_modes, -1, -1)
+        topk_pos = torch.gather(
+            candidate_pos,
+            dim=2,
+            index=topk_idx.unsqueeze(-1).expand(-1, -1, -1, 2),
+        )
+
+        weight_sum = topk_weight.sum(dim=-1, keepdim=True)
+        min_normal = torch.finfo(topk_weight.dtype).tiny
+        normalized_weight = topk_weight / weight_sum.clamp_min(min_normal)
+        uniform_weight = torch.full_like(topk_weight, 1.0 / num_topk)
+        normalized_weight = torch.where(
+            weight_sum > min_normal, normalized_weight, uniform_weight
+        )
+        goal_attn_pos = (
+            topk_pos * normalized_weight.unsqueeze(-1)
+        ).sum(dim=2)  # [B, K, 2]
+
         goal_reg = self.goal_reg(mode_query)
         goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
-        return mode_query, goal_reg, goal_FDE
+        return mode_query, goal_reg, goal_FDE, goal_attn_pos
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
@@ -614,7 +655,7 @@ class BEVTrajDecoder(nn.Module):
         scene_context = scene_context.permute(1, 0, 2)
 
         # -------------------Goal Candidate Proposal -----------------
-        mode_query, goal_reg, goal_FDE = \
+        mode_query, goal_reg, goal_FDE, goal_attn_pos = \
             self.goal_candidate_proposal(
                 bev_feat, ec_dyn, tc_dyn, ego_dyn
             )
@@ -706,6 +747,7 @@ class BEVTrajDecoder(nn.Module):
                   'anchor_pos' : anchor_pos,
                   'predicted_goal_reg': goal_reg,
                   'predicted_goal_FDE': goal_FDE,
+                  'goal_attn_pos': goal_attn_pos,
                 #   'init_top_idx': init_top_idx,                # [B, K]
                   'state_pred': state_pred, # [B, T, 2]
                 }
