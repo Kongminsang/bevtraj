@@ -41,9 +41,9 @@ class BEVTrajDecoderLayer(nn.Module):
         self.bev_cross_attn = BEVDeformCrossAttn(**config['deform_cross_attn'])
 
         # hybrid self-attn: token 길이를 K*T로 보고 attention
-        # self.hybrid_self_attn = nn.MultiheadAttention(
-        #     self.D, self.num_heads, dropout=self.dropout
-        # )
+        self.hybrid_self_attn = nn.MultiheadAttention(
+            self.D, self.num_heads, dropout=self.dropout
+        )
 
         self.ffn = FFN(self.D, self.ffn_D, 2)
     
@@ -97,13 +97,13 @@ class BEVTrajDecoderLayer(nn.Module):
         dec_embed = self.norm[1](self.bev_cross_attn(dec_embed, bev_feat, query_scale, ref_points))
 
         # 5) hybrid self-attn on K*T tokens
-        # hybrid_tokens = dec_embed.permute(0, 2, 1, 3).reshape(num_modes * self.T, B, self.D)  # [K*T,B,D]
-        # hybrid_out = self.hybrid_self_attn(
-        #     query=hybrid_tokens, key=hybrid_tokens, value=hybrid_tokens
-        # )[0]
-        # hybrid_tokens = self.norm[2](hybrid_out + hybrid_tokens)
-        # # restore [K,B,T,D]
-        # dec_embed = hybrid_tokens.reshape(num_modes, self.T, B, self.D).permute(0, 2, 1, 3).contiguous()
+        hybrid_tokens = dec_embed.permute(0, 2, 1, 3).reshape(num_modes * self.T, B, self.D)  # [K*T,B,D]
+        hybrid_out = self.hybrid_self_attn(
+            query=hybrid_tokens, key=hybrid_tokens, value=hybrid_tokens
+        )[0]
+        hybrid_tokens = self.norm[2](hybrid_out + hybrid_tokens)
+        # restore [K,B,T,D]
+        dec_embed = hybrid_tokens.reshape(num_modes, self.T, B, self.D).permute(0, 2, 1, 3).contiguous()
         # =================
 
         dec_embed = self.norm[2](self.ffn(dec_embed))
@@ -196,22 +196,34 @@ class BEVTrajDecoder(nn.Module):
 
         self.bda_sgcp = BDA_DEC(self.config['bda_dec'], self.D)
 
-        # regression
-        self.goal_proposal = []
+        self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
+        nn.init.xavier_uniform_(self.goal_query)
+
+        # BDA anchor tokens are a dense candidate bank.  The proposal queries attend
+        # to that bank and produce the smaller set of trajectory modes.
+        self.goal_proposal = nn.ModuleList()
         for _ in range(self.L_goal_proposal):
-            goal_proposal_layer = nn.ModuleDict({
-                'deform_cross_attn': BEVDeformCrossAttn(**self.dca_cfg),
+            self.goal_proposal.append(nn.ModuleDict({
+                'self_attn': nn.MultiheadAttention(
+                    self.D, self.num_heads, dropout=self.dropout
+                ),
                 'norm1': nn.LayerNorm(self.D),
-                'mode_self_attn': nn.MultiheadAttention(self.D, self.num_heads, dropout=self.dropout),
+
+                'cross_attn': nn.MultiheadAttention(
+                    self.D * 2,
+                    self.num_heads,
+                    dropout=self.dropout,
+                    kdim=self.D * 2,
+                    vdim=self.D,
+                ),
+                'q_proj': MLP(self.D * 2, self.D, self.D, 2),
                 'norm2': nn.LayerNorm(self.D),
+
                 'ffn': FFN(self.D, self.ffn_D, 2),
                 'norm3': nn.LayerNorm(self.D),
-            })
-            self.goal_proposal.append(goal_proposal_layer)
-        self.goal_proposal = nn.ModuleList(self.goal_proposal)
-
-        self.get_query_scale_sgcp = MLP(self.D, self.query_scale_dims, self.query_scale_dims, 2)
+            }))
         self.goal_reg = MLP(self.D, self.D, 2, 2)
+        self.goal_FDE = MLP(self.D, self.D, 1, 2)
 
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
 
@@ -298,11 +310,33 @@ class BEVTrajDecoder(nn.Module):
         return torch.arange(0, self.T, stride, device=device, dtype=torch.long)
 
     def goal_candidate_proposal(self, bev_feat, ec_dyn, tc_dyn, ego_dyn):
-        bda_token, anchor_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
+        bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
+        B = bda_token.size(0)
 
-        mode_query = bda_token.permute(1, 0, 2).contiguous()
+        bda_pos_embed = gen_sineembed_for_position(
+            bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
+        )
+        key = torch.cat([bda_token, bda_pos_embed], dim=-1).permute(1, 0, 2)
+        value = bda_token.permute(1, 0, 2)
 
-        return mode_query, anchor_pos
+        learned_query = self.goal_query.expand(-1, B, -1)
+        mode_query = learned_query
+
+        for layer in self.goal_proposal:
+            residual = mode_query
+            mode_query = layer['norm1'](
+                layer['self_attn'](mode_query, mode_query, mode_query)[0] + residual
+            )
+
+            cross_query = torch.cat([mode_query, learned_query], dim=-1)
+            cross_query = layer['cross_attn'](cross_query, key, value)[0]
+            cross_query = layer['q_proj'](cross_query)
+            mode_query = layer['norm2'](cross_query + mode_query)
+            mode_query = layer['norm3'](layer['ffn'](mode_query))
+
+        goal_reg = self.goal_reg(mode_query)
+        goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
+        return mode_query, goal_reg, goal_FDE
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
@@ -580,10 +614,11 @@ class BEVTrajDecoder(nn.Module):
         scene_context = scene_context.permute(1, 0, 2)
 
         # -------------------Goal Candidate Proposal -----------------
-        mode_query, anchor_pos = \
+        mode_query, goal_reg, goal_FDE = \
             self.goal_candidate_proposal(
                 bev_feat, ec_dyn, tc_dyn, ego_dyn
             )
+        anchor_pos = goal_reg.permute(1, 0, 2).contiguous()
         anchor_pos_detached = anchor_pos.detach()
 
         dense_future_pred = kwargs.get('dense_future_pred')
@@ -669,9 +704,10 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
                   'anchor_pos' : anchor_pos,
+                  'predicted_goal_reg': goal_reg,
+                  'predicted_goal_FDE': goal_FDE,
                 #   'init_top_idx': init_top_idx,                # [B, K]
                   'state_pred': state_pred, # [B, T, 2]
-                #   'goal_FDE_list': goal_FDE_list,
                 }
         return output
     

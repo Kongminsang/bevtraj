@@ -307,16 +307,20 @@ class BDA_DEC(BEVDeformableAggregation):
             for _ in range(self.config['num_bda_layers'])
         ])
 
-        # file_path = 'unitraj/models/bevtraj/cluster_256_center_dict_6s.pkl'
-        file_path = 'unitraj/models/bevtraj/cluster_64_center_dict_6s.pkl'
+        file_path = 'unitraj/models/bevtraj/cluster_256_center_dict_6s.pkl'
+        # file_path = 'unitraj/models/bevtraj/cluster_64_center_dict_6s.pkl'
         # file_path = 'unitraj/models/bevtraj/cluster_32_center_dict_6s.pkl'
         with open(file_path, 'rb') as f:
             anchors = pickle.load(f)
         self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
         # self.anchors = nn.Parameter(torch.from_numpy(anchors['VEHICLE']).float())
 
-        self.ba_query_dec = nn.Parameter(torch.zeros(64, self.D), requires_grad=True) # kong_fixme
-        self.num_ba_query = 64
+        # Keep one BDA token per dense anchor. SGCP later compresses this bank into
+        # the configured number of trajectory modes.
+        self.num_ba_query = self.anchors.shape[0]
+        self.ba_query_dec = nn.Parameter(
+            torch.zeros(self.num_ba_query, self.D), requires_grad=True
+        )
         # self.ba_query_dec = nn.Parameter(torch.zeros(32, self.D), requires_grad=True) # kong_fixme
         # self.num_ba_query = 32
 

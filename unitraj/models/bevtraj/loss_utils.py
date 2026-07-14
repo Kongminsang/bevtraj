@@ -12,6 +12,7 @@ class Criterion(nn.Module):
 
         self.goal_FDE_loss = nn.SmoothL1Loss(reduction='mean', beta=1.0)
         self.smoothness_dt = float(self.config.get('smoothness_dt', 0.1))
+        self.curvature_min_speed = float(self.config.get('curvature_min_speed', 0.5))
         self.inv_smoothness_dt2 = 1.0 / (self.smoothness_dt ** 2)
         self.inv_smoothness_dt3 = 1.0 / (self.smoothness_dt ** 3)
 
@@ -30,12 +31,21 @@ class Criterion(nn.Module):
         loss_jerk = (jerk.square().sum(dim=-1) * jerk_valid).sum()
         loss_jerk = loss_jerk / jerk_valid.sum().clamp_min(1.0)
 
-        # Curvature loss penalizes direction change independent of speed.
-        vel_norm = torch.norm(disp, dim=-1, keepdim=True).clamp_min(1e-6)
-        vel_hat = disp / vel_norm
+        # Direction is undefined at low speeds, so only compare consecutive
+        # displacements that are both above the configured speed threshold.
+        disp_norm = torch.norm(disp, dim=-1)
+        min_disp = self.curvature_min_speed * self.smoothness_dt
+        direction_valid = (
+            (disp_norm[:, :-1] > min_disp)
+            & (disp_norm[:, 1:] > min_disp)
+        ).to(pred_xy.dtype)
+        curvature_valid = accel_valid * direction_valid
+
+        vel_hat = disp / disp_norm.unsqueeze(-1).clamp_min(1e-6)
         cos_theta = (vel_hat[:, :-1, :] * vel_hat[:, 1:, :]).sum(dim=-1)
-        loss_curvature = ((1.0 - cos_theta) * accel_valid).sum()
-        loss_curvature = loss_curvature / accel_valid.sum().clamp_min(1.0)
+        cos_theta = cos_theta.clamp(-1.0, 1.0)
+        loss_curvature = ((1.0 - cos_theta) * curvature_valid).sum()
+        loss_curvature = loss_curvature / curvature_valid.sum().clamp_min(1.0)
 
         return loss_acc, loss_jerk, loss_curvature
 
@@ -45,6 +55,8 @@ class Criterion(nn.Module):
         pred_vels = out['predicted_velocity'] # [K, T, B, 2]
 
         anchor_pos = out['anchor_pos']
+        goal_reg = out['predicted_goal_reg']
+        goal_FDE = out['predicted_goal_FDE']
 
         dense_future_pred = out['dense_future_pred']
 
@@ -62,6 +74,13 @@ class Criterion(nn.Module):
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
 
+        goal_prediction_loss = self.get_goal_prediction_loss(
+            goal_reg=goal_reg,
+            goal_FDE=goal_FDE,
+            gt=gt_decoder,
+            center_gt_final_valid_idx=center_gt_final_valid_idx,
+        )
+
         state_query_loss = self.get_state_query_loss(
             state_pred=state_pred,
             gt=gt_decoder,
@@ -69,7 +88,7 @@ class Criterion(nn.Module):
 
         dense_future_loss = self.get_dense_future_prediction_loss(dense_future_pred, gt_dense_future_trajs)
 
-        total_loss = decoder_loss + state_query_loss + dense_future_loss
+        total_loss = decoder_loss + goal_prediction_loss + state_query_loss + dense_future_loss
         return total_loss
 
     def get_decoder_loss_hard_assign( # EDA
@@ -209,15 +228,13 @@ class Criterion(nn.Module):
 
         return total / num_layers
     
-    def get_goal_prediction_loss(self, goal_reg_list, gt, center_gt_final_valid_idx):
+    def get_goal_prediction_loss(self, goal_reg, goal_FDE, gt, center_gt_final_valid_idx):
         """
-        goal_reg: each [K, B, 2]
-        goal_FDE: each [B, K]
-        gt: [B, T, 3]  # (x, y, valid)
+        goal_reg: [K, B, 2]
+        goal_FDE: [B, K]
+        gt: [B, T, 5]  # (x, y, vx, vy, valid)
         center_gt_final_valid_idx: [B]
         """
-        num_layers = len(goal_reg_list)
-
         device = gt.device
         B = gt.size(0)
         b_idx = torch.arange(B, device=device)
@@ -226,18 +243,32 @@ class Criterion(nn.Module):
         gt_goal = gt[b_idx, final_idx, :2]            # [B, 2]
         valid_final = gt[b_idx, final_idx, -1].float() # [B]
 
-        total_loss = 0.0
-        for goal_reg in goal_reg_list:
-            # ---------------- reg loss ----------------
-            # goal_reg: [K, B, 2] -> [B, K, 2]
-            goal_reg_bk2 = goal_reg.permute(1, 0, 2)
-            dist = torch.norm(goal_reg_bk2 - gt_goal.unsqueeze(1), p=2, dim=-1)  # [B, K]
-            reg_loss_per_sample = dist.min(dim=1)[0]                               # [B]
-            reg_loss = (reg_loss_per_sample * valid_final).sum() / valid_final.sum().clamp_min(1.0)
+        goal_reg_bk2 = goal_reg.permute(1, 0, 2)
+        dist = torch.norm(goal_reg_bk2 - gt_goal.unsqueeze(1), p=2, dim=-1)
+        reg_loss_per_sample = dist.min(dim=1)[0]
+        reg_loss = (
+            (reg_loss_per_sample * valid_final).sum()
+            / valid_final.sum().clamp_min(1.0)
+        )
 
-            total_loss = total_loss + self.config['goal_reg_weight'] * reg_loss
+        # FDE is a detached quality target: it trains the ranking head without
+        # leaking gradients into the proposed goal coordinates.
+        final_goal_reg = goal_reg_bk2.detach()
+        FDE_gt = torch.norm(
+            final_goal_reg - gt_goal.unsqueeze(1), p=2, dim=-1
+        )
+        valid_rows = valid_final.bool()
+        if valid_rows.any():
+            disp_loss = self.goal_FDE_loss(
+                goal_FDE[valid_rows], FDE_gt[valid_rows]
+            )
+        else:
+            disp_loss = goal_FDE.sum() * 0.0
 
-        return total_loss / num_layers
+        return (
+            self.config.get('goal_reg_weight', 1.0) * reg_loss
+            + self.config.get('disp_weight', 1.0) * disp_loss
+        )
     
     def get_state_query_loss(self, state_pred, gt):
         """
