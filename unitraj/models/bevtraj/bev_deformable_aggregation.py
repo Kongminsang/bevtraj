@@ -12,19 +12,6 @@ from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to
 from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA
 
 
-class _NumpyCompatUnpickler(pickle.Unpickler):
-    """Load NumPy-2 pickles in environments that still use NumPy 1.x."""
-
-    def find_class(self, module, name):
-        try:
-            return super().find_class(module, name)
-        except ModuleNotFoundError:
-            if module.startswith('numpy._core'):
-                module = module.replace('numpy._core', 'numpy.core', 1)
-                return super().find_class(module, name)
-            raise
-
-
 class QueryConditionedDynamics(nn.Module):
     """
     dynamics: [batch_size, query_num, dyn_dim]
@@ -146,111 +133,23 @@ class BDALayer_DEC(BDALayer):
         self.query_pos = build_mlp(self.D, self.D, self.D, dropout=self.dropout)
     
     def forward(self, ba_query, query_sine_embed, ref_pos, bev_feat, lid):
-        """
-        Args:
-            ba_query: [B, N, L, D] waypoint tokens for N trajectories.
-            query_sine_embed: [B, N, L, D] waypoint positional/motion features.
-            ref_pos: [B, N, L, 2] normalized ego-centric BEV references.
-            bev_feat: [B, D, H, W].
-
-        Returns:
-            [B, N, L, D] updated waypoint tokens.
-
-        Waypoint self-attention is local to each trajectory. Flattening N and L
-        into a single sequence would create a 3072-token quadratic attention
-        map and would also mix unrelated trajectories before route pooling.
-        """
-        if ba_query.dim() != 4:
-            raise ValueError(
-                f'BDALayer_DEC expects ba_query [B,N,L,D], got {tuple(ba_query.shape)}'
-            )
-
-        B, N, L, D = ba_query.shape
-
-        # Self-Attention over the L ordered waypoints of each trajectory.
+        # Self-Attention
         pos_scale = self.pos_scale(ba_query) if lid != 0 else 1
         self_query_pos = pos_scale * self.query_pos(query_sine_embed)
-
-        waypoint_query = ba_query.reshape(B * N, L, D)
-        waypoint_pos = self_query_pos.reshape(B * N, L, D)
-        tgt = self.with_pos_embed(waypoint_query, waypoint_pos)
-        tgt, _ = self.self_attn(tgt, tgt, waypoint_query)
-        tgt = self.norm_layers[0](
-            waypoint_query + self.dropout_layers[0](tgt)
-        ).reshape(B, N, L, D)
         
-        # Deformable BEV cross-attention is linear in the number of reference
-        # points, so flatten N*L only for sampling and restore it afterwards.
+        tgt = self.with_pos_embed(ba_query, self_query_pos)
+        tgt, _ = self.self_attn(tgt, tgt, ba_query)
+        tgt = self.norm_layers[0](ba_query + self.dropout_layers[0](tgt))
+        
+        # Cross-Attention
         cross_pos_scale = self.pos_scale(tgt)
         cross_query_pos = cross_pos_scale * self.query_pos(query_sine_embed)
 
-        tgt_flat = tgt.reshape(B, N * L, D)
-        cross_query_pos = cross_query_pos.reshape(B, N * L, D)
-        ref_pos = ref_pos.reshape(B, N * L, 2)
-        tgt2 = self.cross_attn(tgt_flat, cross_query_pos, ref_pos, bev_feat)
-        tgt2 = tgt2.reshape(B, N, L, D)
+        tgt2 = self.cross_attn(tgt, cross_query_pos, ref_pos, bev_feat)
         tgt2 = self.norm_layers[1](tgt + self.dropout_layers[1](tgt2))
-
+        
         output = self.norm_layers[2](self.ffn(tgt2))
         return output
-
-
-class TrajectoryWaypointPool(nn.Module):
-    """Compress the waypoint tokens of each trajectory into one BDA token."""
-
-    def __init__(self, d_model, num_heads, ffn_dims, dropout):
-        super().__init__()
-        self.D = d_model
-
-        # Endpoint keeps the token goal-oriented, while mean and max prevent
-        # pooling from depending on the endpoint alone.
-        self.seed_proj = MLP(self.D * 3, self.D, self.D, 2)
-        self.pos_proj = MLP(self.D, self.D, self.D, 2)
-        self.waypoint_attn = nn.MultiheadAttention(
-            self.D,
-            num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.out_proj = MLP(self.D * 4, self.D, self.D, 2)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(self.D)
-        self.ffn = FFN(self.D, ffn_dims, num_fcs=2, dropout=dropout)
-
-    def forward(self, waypoint_tokens, waypoint_pos):
-        """
-        Args:
-            waypoint_tokens: [B, N, L, D] output of the BDA layers.
-            waypoint_pos: [B, N, L, D] trajectory position/motion embedding.
-
-        Returns:
-            [B, N, D] one route-aware token per trajectory.
-        """
-        B, N, L, D = waypoint_tokens.shape
-        tokens = waypoint_tokens.reshape(B * N, L, D)
-        pos = self.pos_proj(waypoint_pos).reshape(B * N, L, D)
-
-        endpoint = tokens[:, -1]
-        mean_pool = tokens.mean(dim=1)
-        max_pool = tokens.amax(dim=1)
-        seed = self.seed_proj(torch.cat([endpoint, mean_pool, max_pool], dim=-1))
-
-        # The endpoint-conditioned query decides which route portions matter
-        # for this goal; positional keys preserve waypoint order/geometry.
-        query = (seed + pos[:, -1]).unsqueeze(1)
-        attn_pool = self.waypoint_attn(
-            query=query,
-            key=tokens + pos,
-            value=tokens,
-            need_weights=False,
-        )[0].squeeze(1)
-
-        fused = self.out_proj(
-            torch.cat([attn_pool, endpoint, mean_pool, max_pool], dim=-1)
-        )
-        pooled = self.norm(seed + self.dropout(fused))
-        pooled = self.ffn(pooled)
-        return pooled.reshape(B, N, D)
     
     
 class BEVDeformableAggregation(nn.Module, ABC):
@@ -408,34 +307,22 @@ class BDA_DEC(BEVDeformableAggregation):
             for _ in range(self.config['num_bda_layers'])
         ])
 
-        trajectory_file_name = config.get(
-            'trajectory_file_name', 'trajectory_set_256.pkl'
-        )
-        file_path = 'unitraj/models/bevtraj/' + trajectory_file_name
+        file_path = 'unitraj/models/bevtraj/cluster_256_center_dict_6s.pkl'
+        # file_path = 'unitraj/models/bevtraj/cluster_64_center_dict_6s.pkl'
+        # file_path = 'unitraj/models/bevtraj/cluster_32_center_dict_6s.pkl'
         with open(file_path, 'rb') as f:
-            trajectory_set = _NumpyCompatUnpickler(f).load()
-        trajectories = torch.from_numpy(trajectory_set['VEHICLE']).float()
-        if trajectories.dim() != 3 or trajectories.size(-1) != 2:
-            raise ValueError(
-                'trajectory_set["VEHICLE"] must have shape [N,L,2], '
-                f'got {tuple(trajectories.shape)}'
-            )
-        self.register_buffer('trajectories', trajectories)
+            anchors = pickle.load(f)
+        self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
+        # self.anchors = nn.Parameter(torch.from_numpy(anchors['VEHICLE']).float())
 
-        self.num_ba_query = self.trajectories.shape[0]
-        self.num_waypoints = self.trajectories.shape[1]
+        # Keep one BDA token per dense anchor. SGCP later compresses this bank into
+        # the configured number of trajectory modes.
+        self.num_ba_query = self.anchors.shape[0]
         self.ba_query_dec = nn.Parameter(
             torch.zeros(self.num_ba_query, self.D), requires_grad=True
         )
-        self.waypoint_query = nn.Parameter(
-            torch.zeros(self.num_waypoints, self.D), requires_grad=True
-        )
-        self.trajectory_pool = TrajectoryWaypointPool(
-            d_model=self.D,
-            num_heads=self.config['bda_layer']['num_heads'],
-            ffn_dims=self.config['bda_layer']['ffn_dims'],
-            dropout=self.dropout,
-        )
+        # self.ba_query_dec = nn.Parameter(torch.zeros(32, self.D), requires_grad=True) # kong_fixme
+        # self.num_ba_query = 32
 
     def build_anchor_relation_feat(self, ref_pos_target, tc_dyn):
         eps = 1e-3
@@ -449,21 +336,18 @@ class BDA_DEC(BEVDeformableAggregation):
         target_vel = tc_dyn[:, -1, 2:4]
         speed = torch.norm(target_vel, dim=-1, keepdim=True)
         heading = target_vel / speed.clamp_min(eps)
-        expand_dims = [1] * (ref_pos_target.dim() - 2)
-        heading = heading.view(heading.size(0), *expand_dims, 2)
-        heading = heading.expand_as(ref_pos_target)
+        heading = heading.unsqueeze(1).expand(-1, self.num_ba_query, -1)
         heading_perp = torch.stack([-heading[..., 1], heading[..., 0]], dim=-1)
 
         longi = (ref_pos_target * heading).sum(dim=-1)
         lateral = (ref_pos_target * heading_perp).sum(dim=-1)
-        speed = speed.view(speed.size(0), *expand_dims)
         time_to_reach = r / speed.clamp_min(eps)
 
         rel_feat = torch.stack([
             dx, dy, r,
             sin_theta, cos_theta,
             longi, lateral,
-            time_to_reach,
+            time_to_reach.squeeze(-1),
         ], dim=-1)
         return rel_feat
 
@@ -475,12 +359,10 @@ class BDA_DEC(BEVDeformableAggregation):
 
     def forward(self, bev_feat, ec_dyn, tc_dyn, ego_dyn):
         B = bev_feat.shape[0]
-        output = (
-            self.ba_query_dec[:, None, :] + self.waypoint_query[None, :, :]
-        )[None].repeat(B, 1, 1, 1)
+        # output = self.ba_query[None].repeat(B, 1, 1)
+        output = self.ba_query_dec[None].repeat(B, 1, 1) # kong_fixme
 
-        ref_pos_target = self.trajectories[None].repeat(B, 1, 1, 1)
-        num_trajectories, num_waypoints = ref_pos_target.shape[1:3]
+        ref_pos_target = self.anchors[None].repeat(B, 1, 1)
 
         trans_x, trans_y, rot_sin, rot_cos = (
             ego_dyn['ego_x'],
@@ -488,13 +370,7 @@ class BDA_DEC(BEVDeformableAggregation):
             ego_dyn['ego_sin'],
             ego_dyn['ego_cos'],
         )
-        ref_pos = target_to_ego(
-            ref_pos_target.reshape(B, num_trajectories * num_waypoints, 2),
-            trans_x,
-            trans_y,
-            rot_sin,
-            rot_cos,
-        ).reshape(B, num_trajectories, num_waypoints, 2)
+        ref_pos = target_to_ego(ref_pos_target, trans_x, trans_y, rot_sin, rot_cos)
 
         # =============================== prototype ================================
         # tc features build query semantics, while ec coordinates remain responsible
@@ -509,28 +385,21 @@ class BDA_DEC(BEVDeformableAggregation):
         ).permute(1, 0, 2)
         tc_step_feat = self.tc_temporal_norm(tc_step_feat + tc_step_feat_temporal)
 
-        anchor_tc = gen_sineembed_for_position(
-            ref_pos_target, hidden_dim=self.D, temperature=10000
-        )
+        anchor_tc = gen_sineembed_for_position(ref_pos_target, hidden_dim=self.D, temperature=10000)
         anchor_feat = self.anchor_enc['tc'](anchor_tc)
 
         anchor_rel_feat = self.build_anchor_relation_feat(ref_pos_target, tc_dyn)
         anchor_rel_feat = self.anchor_enc['rel'](anchor_rel_feat)
         anchor_feat = anchor_feat + anchor_rel_feat
 
-        anchor_feat_flat = anchor_feat.reshape(
-            B, num_trajectories * num_waypoints, self.D
-        )
         tc_d = self.tc_anchor_attn(
-            query=anchor_feat_flat,
+            query=anchor_feat,
             key=tc_step_feat,
             value=tc_step_feat,
         )[0]
-        tc_d = self.tc_anchor_norm(tc_d + anchor_feat_flat)
-        tc_d = self.dynamics_enc['tc_q'](tc_d, anchor_feat_flat)
-        motion_feat = self.dynamics_enc['motion_fuse'](
-            torch.cat([tc_d, anchor_feat_flat], dim=-1)
-        ).reshape(B, num_trajectories, num_waypoints, self.D)
+        tc_d = self.tc_anchor_norm(tc_d + anchor_feat)
+        tc_d = self.dynamics_enc['tc_q'](tc_d, anchor_feat) # (B, num_ba_query, D)
+        motion_feat = self.dynamics_enc['motion_fuse'](torch.cat([tc_d, anchor_feat], dim=-1))
         output = output + motion_feat
 
         ref_pos_norm = ref_pos / self.denorm_scale[None, None, :]
@@ -541,7 +410,5 @@ class BDA_DEC(BEVDeformableAggregation):
 
         for lid, layer in enumerate(self.bda_layers):
             output = layer(output, query_sine_embed, ref_pos_norm, bev_feat, lid)
-
-        output = self.trajectory_pool(output, query_sine_embed)
-        endpoint = ref_pos_target[:, :, -1, :]
-        return output, endpoint
+            
+        return output, ref_pos_target

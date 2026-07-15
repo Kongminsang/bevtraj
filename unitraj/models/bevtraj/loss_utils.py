@@ -55,9 +55,8 @@ class Criterion(nn.Module):
         pred_vels = out['predicted_velocity'] # [K, T, B, 2]
 
         anchor_pos = out['anchor_pos']
-        goal_reg = out['predicted_goal_reg']
+        goal_position = out['predicted_goal_position']
         goal_FDE = out['predicted_goal_FDE']
-        goal_attn_pos = out['goal_attn_pos']
 
         dense_future_pred = out['dense_future_pred']
 
@@ -76,9 +75,8 @@ class Criterion(nn.Module):
         )
 
         goal_prediction_loss = self.get_goal_prediction_loss(
-            goal_reg=goal_reg,
+            goal_position=goal_position,
             goal_FDE=goal_FDE,
-            goal_attn_pos=goal_attn_pos,
             gt=gt_decoder,
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
@@ -230,18 +228,10 @@ class Criterion(nn.Module):
 
         return total / num_layers
     
-    def get_goal_prediction_loss(
-        self,
-        goal_reg,
-        goal_FDE,
-        goal_attn_pos,
-        gt,
-        center_gt_final_valid_idx,
-    ):
+    def get_goal_prediction_loss(self, goal_position, goal_FDE, gt, center_gt_final_valid_idx):
         """
-        goal_reg: [K, B, 2]
+        goal_position: [K, B, 2]
         goal_FDE: [B, K]
-        goal_attn_pos: [B, K, 2]
         gt: [B, T, 5]  # (x, y, vx, vy, valid)
         center_gt_final_valid_idx: [B]
         """
@@ -253,27 +243,19 @@ class Criterion(nn.Module):
         gt_goal = gt[b_idx, final_idx, :2]            # [B, 2]
         valid_final = gt[b_idx, final_idx, -1].float() # [B]
 
-        goal_reg_bk2 = goal_reg.permute(1, 0, 2)
-        with torch.no_grad():
-            assignment_dist = torch.norm(
-                goal_attn_pos.detach() - gt_goal.unsqueeze(1), p=2, dim=-1
-            )
-            positive_idx = assignment_dist.argmin(dim=1)
-
-        positive_goal_reg = goal_reg_bk2[b_idx, positive_idx]
-        reg_loss_per_sample = torch.norm(
-            positive_goal_reg - gt_goal, p=2, dim=-1
-        )
-        reg_loss = (
-            (reg_loss_per_sample * valid_final).sum()
+        goal_position_bk2 = goal_position.permute(1, 0, 2)
+        dist = torch.norm(goal_position_bk2 - gt_goal.unsqueeze(1), p=2, dim=-1)
+        position_loss_per_sample = dist.min(dim=1)[0]
+        position_loss = (
+            (position_loss_per_sample * valid_final).sum()
             / valid_final.sum().clamp_min(1.0)
         )
 
         # FDE is a detached quality target: it trains the ranking head without
         # leaking gradients into the proposed goal coordinates.
-        final_goal_reg = goal_reg_bk2.detach()
+        final_goal_position = goal_position_bk2.detach()
         FDE_gt = torch.norm(
-            final_goal_reg - gt_goal.unsqueeze(1), p=2, dim=-1
+            final_goal_position - gt_goal.unsqueeze(1), p=2, dim=-1
         )
         valid_rows = valid_final.bool()
         if valid_rows.any():
@@ -284,7 +266,9 @@ class Criterion(nn.Module):
             disp_loss = goal_FDE.sum() * 0.0
 
         return (
-            self.config.get('goal_reg_weight', 1.0) * reg_loss
+            self.config.get(
+                'goal_position_weight', self.config.get('goal_reg_weight', 1.0)
+            ) * position_loss
             + self.config.get('disp_weight', 1.0) * disp_loss
         )
     

@@ -245,7 +245,7 @@ MODEL:
 
     loss:
         # SGCP loss
-        goal_reg_weight: 3.0
+        goal_position_weight: 3.0
         disp_weight: 1.0
         # goal_prob branch (posterior + entropy + KL)
         entropy_weight: 0.05

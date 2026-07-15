@@ -161,9 +161,6 @@ class BEVTrajDecoder(nn.Module):
         self.spa_pos_T = config['spa_pos_T']
         self.dropout = config['dropout']
         self.L_goal_proposal = config['num_goal_proposal_layers']
-        self.goal_attn_topk = int(config.get('goal_attn_topk', 8))
-        if self.goal_attn_topk <= 0:
-            raise ValueError('goal_attn_topk must be a positive integer')
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
@@ -199,11 +196,20 @@ class BEVTrajDecoder(nn.Module):
 
         self.bda_sgcp = BDA_DEC(self.config['bda_dec'], self.D)
 
+        file_path = 'unitraj/models/bevtraj/cluster_10mode_64anchors_detailed_6s.pkl'
+        with open(file_path, 'rb') as f:
+            goal_anchor_indices = torch.tensor(
+                pickle.load(f)['VEHICLE']['anchor_indices']
+            ).long()
+        self.register_buffer(
+            'goal_anchor_indices', goal_anchor_indices, persistent=False
+        )
+
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
 
-        # BDA anchor tokens are a dense candidate bank.  The proposal queries attend
-        # to that bank and produce the smaller set of trajectory modes.
+        # BDA anchor tokens are a dense candidate bank. Each proposal query attends
+        # only to its spatial cluster and produces one trajectory mode.
         self.goal_proposal = nn.ModuleList()
         for _ in range(self.L_goal_proposal):
             self.goal_proposal.append(nn.ModuleDict({
@@ -225,7 +231,6 @@ class BEVTrajDecoder(nn.Module):
                 'ffn': FFN(self.D, self.ffn_D, 2),
                 'norm3': nn.LayerNorm(self.D),
             }))
-        self.goal_reg = MLP(self.D, self.D, 2, 2)
         self.goal_FDE = MLP(self.D, self.D, 1, 2)
 
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
@@ -316,15 +321,21 @@ class BEVTrajDecoder(nn.Module):
         bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
         B = bda_token.size(0)
 
+        # Give each mode a soft spatial identity by restricting its cross-attention
+        # to the corresponding cluster of dense BDA anchors.
+        clustered_token = bda_token[:, self.goal_anchor_indices]  # [B, K, A, D]
+        clustered_pos = bda_pos[:, self.goal_anchor_indices]      # [B, K, A, 2]
         bda_pos_embed = gen_sineembed_for_position(
-            bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
+            clustered_pos, hidden_dim=self.D, temperature=self.spa_pos_T
         )
-        key = torch.cat([bda_token, bda_pos_embed], dim=-1).permute(1, 0, 2)
-        value = bda_token.permute(1, 0, 2)
+        num_cluster_anchors = clustered_token.size(2)
+        key = torch.cat([clustered_token, bda_pos_embed], dim=-1)
+        key = key.reshape(B * self.K, num_cluster_anchors, -1).permute(1, 0, 2)
+        value = clustered_token.reshape(B * self.K, num_cluster_anchors, self.D)
+        value = value.permute(1, 0, 2)
 
         learned_query = self.goal_query.expand(-1, B, -1)
         mode_query = learned_query
-        final_cross_attn = None
 
         for layer_idx, layer in enumerate(self.goal_proposal):
             residual = mode_query
@@ -333,51 +344,36 @@ class BEVTrajDecoder(nn.Module):
             )
 
             cross_query = torch.cat([mode_query, learned_query], dim=-1)
+            cross_query = cross_query.permute(1, 0, 2).reshape(B * self.K, -1)
+            cross_query = cross_query.unsqueeze(0)
             is_last_layer = layer_idx == len(self.goal_proposal) - 1
             cross_query, cross_attn = layer['cross_attn'](
                 cross_query,
                 key,
                 value,
                 need_weights=is_last_layer,
-                average_attn_weights=True,
             )
+            cross_query = cross_query.squeeze(0).reshape(B, self.K, -1)
+            cross_query = cross_query.permute(1, 0, 2).contiguous()
             if is_last_layer:
-                final_cross_attn = cross_attn
+                final_cross_attn = cross_attn.squeeze(1).reshape(
+                    B, self.K, num_cluster_anchors
+                )
             cross_query = layer['q_proj'](cross_query)
             mode_query = layer['norm2'](cross_query + mode_query)
             mode_query = layer['norm3'](layer['ffn'](mode_query))
 
-        if final_cross_attn is None:
-            raise RuntimeError('goal_proposal must contain at least one layer')
+        # MultiheadAttention returns post-dropout weights during training, so
+        # normalize once more before using them as spatial mixture coefficients.
+        normalized_attn = final_cross_attn / final_cross_attn.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
+        goal_position = (
+            clustered_pos * normalized_attn.unsqueeze(-1)
+        ).sum(dim=2).permute(1, 0, 2).contiguous()
 
-        # final_cross_attn: [B, K, N_ref].  Associate each mode with a spatial
-        # point using only its strongest reference-point evidence.
-        if final_cross_attn.size(-1) == 0:
-            raise RuntimeError('goal cross attention received no reference points')
-        num_topk = min(self.goal_attn_topk, final_cross_attn.size(-1))
-        topk_weight, topk_idx = final_cross_attn.topk(num_topk, dim=-1)
-        num_modes = final_cross_attn.size(1)
-        candidate_pos = bda_pos[:, None, :, :].expand(-1, num_modes, -1, -1)
-        topk_pos = torch.gather(
-            candidate_pos,
-            dim=2,
-            index=topk_idx.unsqueeze(-1).expand(-1, -1, -1, 2),
-        )
-
-        weight_sum = topk_weight.sum(dim=-1, keepdim=True)
-        min_normal = torch.finfo(topk_weight.dtype).tiny
-        normalized_weight = topk_weight / weight_sum.clamp_min(min_normal)
-        uniform_weight = torch.full_like(topk_weight, 1.0 / num_topk)
-        normalized_weight = torch.where(
-            weight_sum > min_normal, normalized_weight, uniform_weight
-        )
-        goal_attn_pos = (
-            topk_pos * normalized_weight.unsqueeze(-1)
-        ).sum(dim=2)  # [B, K, 2]
-
-        goal_reg = self.goal_reg(mode_query)
         goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
-        return mode_query, goal_reg, goal_FDE, goal_attn_pos
+        return mode_query, goal_position, goal_FDE
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
@@ -655,11 +651,11 @@ class BEVTrajDecoder(nn.Module):
         scene_context = scene_context.permute(1, 0, 2)
 
         # -------------------Goal Candidate Proposal -----------------
-        mode_query, goal_reg, goal_FDE, goal_attn_pos = \
+        mode_query, goal_position, goal_FDE = \
             self.goal_candidate_proposal(
                 bev_feat, ec_dyn, tc_dyn, ego_dyn
             )
-        anchor_pos = goal_reg.permute(1, 0, 2).contiguous()
+        anchor_pos = goal_position.permute(1, 0, 2).contiguous()
         anchor_pos_detached = anchor_pos.detach()
 
         dense_future_pred = kwargs.get('dense_future_pred')
@@ -745,9 +741,8 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
                   'anchor_pos' : anchor_pos,
-                  'predicted_goal_reg': goal_reg,
+                  'predicted_goal_position': goal_position,
                   'predicted_goal_FDE': goal_FDE,
-                  'goal_attn_pos': goal_attn_pos,
                 #   'init_top_idx': init_top_idx,                # [B, K]
                   'state_pred': state_pred, # [B, T, 2]
                 }

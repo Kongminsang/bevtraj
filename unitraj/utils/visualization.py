@@ -207,7 +207,7 @@ def visualize_prediction(batch, prediction, draw_index=0,
     pred_future_prob = prediction['predicted_probability'][draw_index].detach().cpu().numpy()
     pred_future_traj = prediction['predicted_trajectory'][draw_index].detach().cpu().numpy()
     dense_future_pred = prediction['dense_future_pred'][draw_index].detach().cpu().numpy()
-    goal_reg = prediction['goal_reg'][:, draw_index].detach().cpu().numpy()
+    goal_position = prediction['goal_position'][:, draw_index].detach().cpu().numpy()
 
     target_idx = batch['track_index_to_predict'][draw_index].item()
 
@@ -275,7 +275,7 @@ def visualize_prediction(batch, prediction, draw_index=0,
         )
 
         # goal point
-        goal_xy = goal_reg[mode_idx, :2]
+        goal_xy = goal_position[mode_idx, :2]
         ax.scatter(
             goal_xy[0], goal_xy[1],
             s=150,
