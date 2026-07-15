@@ -182,42 +182,49 @@ class BaseModel(pl.LightningModule):
 
         predicted_traj = prediction['predicted_trajectory']
         predicted_prob = prediction['predicted_probability'].detach().cpu().numpy()
+        ranked_indices = np.argsort(predicted_prob, axis=1)[:, ::-1]
+        num_modes = predicted_prob.shape[1]
+        top5_indices = ranked_indices[:, :min(5, num_modes)]
+        top10_indices = ranked_indices[:, :min(10, num_modes)]
 
         # Calculate ADE losses
         ade_diff = torch.norm(predicted_traj[:, :, :, :2] - gt_traj[:, :, :, :2], 2, dim=-1)
         valid_counts = gt_traj_mask.sum(dim=-1).clamp_min(1e-6)
         ade_losses = torch.sum(ade_diff * gt_traj_mask, dim=-1) / valid_counts
         ade_losses = ade_losses.cpu().detach().numpy() # (B, K)
-        
-        top5_indices = np.argsort(predicted_prob, axis=1)[:, -5:]  # (B, 5)
+
         top5_ade_losses = np.take_along_axis(ade_losses, top5_indices, axis=1) # (B, 5)
+        top10_ade_losses = np.take_along_axis(ade_losses, top10_indices, axis=1) # (B, 10)
         
         minade5 = np.min(top5_ade_losses, axis=1) # (B)
-        minade10 = np.min(ade_losses, axis=1) # (B)
+        minade10 = np.min(top10_ade_losses, axis=1) # (B)
         
         # Calculate FDE losses
         bs, modes, future_len = ade_diff.shape
         center_gt_final_valid_idx = center_gt_final_valid_idx.view(-1, 1, 1).repeat(1, modes, 1).to(torch.int64)
 
         fde = torch.gather(ade_diff, -1, center_gt_final_valid_idx).cpu().detach().numpy().squeeze(-1)
+        top10_fde = np.take_along_axis(fde, top10_indices, axis=1)
         
         top1_indices = np.argmax(predicted_prob, axis=1)
         
         minfde1 = fde[np.arange(bs), top1_indices]
-        minfde10 = np.min(fde, axis=-1)
+        minfde10 = np.min(top10_fde, axis=-1)
 
-        best_fde_idx = np.argmin(fde, axis=-1)
-        predicted_prob = predicted_prob[np.arange(bs), best_fde_idx]
-        miss_rate10 = (minfde10 > 2.0)
-        brier_fde10 = minfde10 + np.square(1 - predicted_prob)
+        # nuScenes MissRateTopK uses max pointwise displacement over the full valid horizon, not FDE.
+        valid_ade_diff = ade_diff.masked_fill(gt_traj_mask == 0, 0.0)
+        max_displacement = valid_ade_diff.max(dim=-1).values.cpu().detach().numpy()
+        mode_misses = max_displacement >= 2.0
+        miss_rate5 = np.take_along_axis(mode_misses, top5_indices, axis=1).all(axis=1)
+        miss_rate10 = np.take_along_axis(mode_misses, top10_indices, axis=1).all(axis=1)
 
         loss_dict = {
             'minADE5': minade5,
             'minADE10': minade10,
             'minFDE1': minfde1,
             'minFDE10': minfde10,
-            'miss_rate10': miss_rate10.astype(np.float32),
-            'brier_fde10': brier_fde10}
+            'miss_rate5': miss_rate5.astype(np.float32),
+            'miss_rate10': miss_rate10.astype(np.float32)}
 
         important_metrics = list(loss_dict.keys())
 

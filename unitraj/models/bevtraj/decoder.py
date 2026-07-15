@@ -161,6 +161,7 @@ class BEVTrajDecoder(nn.Module):
         self.spa_pos_T = config['spa_pos_T']
         self.dropout = config['dropout']
         self.L_goal_proposal = config['num_goal_proposal_layers']
+        self.goal_attn_temperature = config.get('goal_attn_temperature', 0.25)
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
@@ -201,15 +202,19 @@ class BEVTrajDecoder(nn.Module):
             goal_anchor_indices = torch.tensor(
                 pickle.load(f)['VEHICLE']['anchor_indices']
             ).long()
+        goal_attn_mask = torch.ones(
+            self.K, self.bda_sgcp.anchors.size(0), dtype=torch.bool
+        )
+        goal_attn_mask.scatter_(1, goal_anchor_indices, False)
         self.register_buffer(
-            'goal_anchor_indices', goal_anchor_indices, persistent=False
+            'goal_attn_mask', goal_attn_mask, persistent=False
         )
 
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
 
-        # BDA anchor tokens are a dense candidate bank. Each proposal query attends
-        # only to its spatial cluster and produces one trajectory mode.
+        # BDA anchor tokens are shared across modes. The attention mask gives each
+        # proposal query access only to its own spatial cluster.
         self.goal_proposal = nn.ModuleList()
         for _ in range(self.L_goal_proposal):
             self.goal_proposal.append(nn.ModuleDict({
@@ -321,18 +326,11 @@ class BEVTrajDecoder(nn.Module):
         bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
         B = bda_token.size(0)
 
-        # Give each mode a soft spatial identity by restricting its cross-attention
-        # to the corresponding cluster of dense BDA anchors.
-        clustered_token = bda_token[:, self.goal_anchor_indices]  # [B, K, A, D]
-        clustered_pos = bda_pos[:, self.goal_anchor_indices]      # [B, K, A, 2]
         bda_pos_embed = gen_sineembed_for_position(
-            clustered_pos, hidden_dim=self.D, temperature=self.spa_pos_T
+            bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
         )
-        num_cluster_anchors = clustered_token.size(2)
-        key = torch.cat([clustered_token, bda_pos_embed], dim=-1)
-        key = key.reshape(B * self.K, num_cluster_anchors, -1).permute(1, 0, 2)
-        value = clustered_token.reshape(B * self.K, num_cluster_anchors, self.D)
-        value = value.permute(1, 0, 2)
+        key = torch.cat([bda_token, bda_pos_embed], dim=-1).permute(1, 0, 2)
+        value = bda_token.permute(1, 0, 2)
 
         learned_query = self.goal_query.expand(-1, B, -1)
         mode_query = learned_query
@@ -344,32 +342,32 @@ class BEVTrajDecoder(nn.Module):
             )
 
             cross_query = torch.cat([mode_query, learned_query], dim=-1)
-            cross_query = cross_query.permute(1, 0, 2).reshape(B * self.K, -1)
-            cross_query = cross_query.unsqueeze(0)
             is_last_layer = layer_idx == len(self.goal_proposal) - 1
             cross_query, cross_attn = layer['cross_attn'](
                 cross_query,
                 key,
                 value,
+                attn_mask=self.goal_attn_mask,
                 need_weights=is_last_layer,
             )
-            cross_query = cross_query.squeeze(0).reshape(B, self.K, -1)
-            cross_query = cross_query.permute(1, 0, 2).contiguous()
             if is_last_layer:
-                final_cross_attn = cross_attn.squeeze(1).reshape(
-                    B, self.K, num_cluster_anchors
-                )
+                final_cross_attn = cross_attn
             cross_query = layer['q_proj'](cross_query)
             mode_query = layer['norm2'](cross_query + mode_query)
             mode_query = layer['norm3'](layer['ffn'](mode_query))
 
-        # MultiheadAttention returns post-dropout weights during training, so
-        # normalize once more before using them as spatial mixture coefficients.
-        normalized_attn = final_cross_attn / final_cross_attn.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-6)
+        # Sharpen the differentiable attention distribution for a goal position
+        # closer to the highest-scoring anchor. Compute in fp32 for AMP stability.
+        tempered_log_attn = (
+            final_cross_attn.float().clamp_min(1e-12).log()
+            / self.goal_attn_temperature
+        )
+        tempered_log_attn = tempered_log_attn.masked_fill(
+            self.goal_attn_mask[None], float('-inf')
+        )
+        normalized_attn = tempered_log_attn.softmax(dim=-1)
         goal_position = (
-            clustered_pos * normalized_attn.unsqueeze(-1)
+            bda_pos[:, None] * normalized_attn.unsqueeze(-1)
         ).sum(dim=2).permute(1, 0, 2).contiguous()
 
         goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T

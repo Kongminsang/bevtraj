@@ -208,6 +208,7 @@ MODEL:
 
         dropout: 0.1
         num_goal_proposal_layers: 2
+        goal_attn_temperature: 0.25
         num_decoder_layers: 6
         num_heads: 16
         score_time_stride_late_layers: 4
