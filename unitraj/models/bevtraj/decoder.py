@@ -213,6 +213,11 @@ class BEVTrajDecoder(nn.Module):
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
 
+        self.goal_scene_cross_attn = nn.MultiheadAttention(
+            self.D, self.num_heads, dropout=self.dropout
+        )
+        self.goal_scene_norm = nn.LayerNorm(self.D)
+
         # BDA anchor tokens are shared across modes. The attention mask gives each
         # proposal query access only to its own spatial cluster.
         self.goal_proposal = nn.ModuleList()
@@ -322,7 +327,15 @@ class BEVTrajDecoder(nn.Module):
             return None
         return torch.arange(0, self.T, stride, device=device, dtype=torch.long)
 
-    def goal_candidate_proposal(self, bev_feat, ec_dyn, tc_dyn, ego_dyn):
+    def goal_candidate_proposal(
+        self,
+        bev_feat,
+        ec_dyn,
+        tc_dyn,
+        ego_dyn,
+        scene_context,
+        scene_key_padding_mask=None,
+    ):
         bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
         B = bda_token.size(0)
 
@@ -333,7 +346,15 @@ class BEVTrajDecoder(nn.Module):
         value = bda_token.permute(1, 0, 2)
 
         learned_query = self.goal_query.expand(-1, B, -1)
-        mode_query = learned_query
+        mode_query = self.goal_scene_norm(
+            self.goal_scene_cross_attn(
+                query=learned_query,
+                key=scene_context,
+                value=scene_context,
+                key_padding_mask=scene_key_padding_mask,
+                need_weights=False,
+            )[0] + learned_query
+        )
 
         for layer_idx, layer in enumerate(self.goal_proposal):
             residual = mode_query
@@ -644,21 +665,30 @@ class BEVTrajDecoder(nn.Module):
         scene_context_tokens = scene_context
         n = scene_context.shape[1]
 
+        dense_future_pred = kwargs.get('dense_future_pred')
+        obj_valid_mask = kwargs.get('obj_valid_mask')
+        target_idx = kwargs.get('target_idx')
+
         scene_context_repeat = scene_context.unsqueeze(2).repeat(1, 1, self.T, 1)
         scene_context_repeat = scene_context_repeat.permute(1, 0, 2, 3).reshape(n, B * self.T, -1)
         scene_context = scene_context.permute(1, 0, 2)
 
+        scene_key_padding_mask = None
+        if obj_valid_mask is not None:
+            scene_key_padding_mask = ~obj_valid_mask.bool()
+
         # -------------------Goal Candidate Proposal -----------------
         mode_query, goal_position, goal_FDE = \
             self.goal_candidate_proposal(
-                bev_feat, ec_dyn, tc_dyn, ego_dyn
+                bev_feat,
+                ec_dyn,
+                tc_dyn,
+                ego_dyn,
+                scene_context,
+                scene_key_padding_mask=scene_key_padding_mask,
             )
         anchor_pos = goal_position.permute(1, 0, 2).contiguous()
         anchor_pos_detached = anchor_pos.detach()
-
-        dense_future_pred = kwargs.get('dense_future_pred')
-        obj_valid_mask = kwargs.get('obj_valid_mask')
-        target_idx = kwargs.get('target_idx')
 
         # -------------------- Initial Prediction --------------------
         dec_embed, init_mode_prob, init_pred_traj, init_pred_vel, state_pred = \
