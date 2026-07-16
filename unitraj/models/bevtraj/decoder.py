@@ -1,6 +1,7 @@
 import math
 import copy
 import pickle
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,9 @@ from unitraj.models.bevtraj.linear import MLP, FFN, MotionRegHead, MotionVelHead
 from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to_ego
 
 from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA, TemporalMHA_NoTimePE
+
+
+MODEL_DIR = Path(__file__).resolve().parent
 
 
 class BEVTrajDecoderLayer(nn.Module):
@@ -200,7 +204,8 @@ class BEVTrajDecoder(nn.Module):
 
         self.bda_sgcp = BDA_DEC(self.config['bda_dec'], self.D)
 
-        file_path = 'unitraj/models/bevtraj/cluster_10mode_64anchors_detailed_6s.pkl'
+        self.goal_anchor_file_name = config['goal_anchor_file_name']
+        file_path = MODEL_DIR / self.goal_anchor_file_name
         with open(file_path, 'rb') as f:
             goal_anchor_indices = torch.tensor(
                 pickle.load(f)['VEHICLE']['anchor_indices']
@@ -254,7 +259,8 @@ class BEVTrajDecoder(nn.Module):
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
 
         # ============================ Initial Prediction ==============================
-        file_path = 'unitraj/models/bevtraj/trajectory_set_256.pkl'
+        self.trajectory_file_name = config['trajectory_file_name']
+        file_path = MODEL_DIR / self.trajectory_file_name
         with open(file_path, 'rb') as f:
             trajectory_set = pickle.load(f)['VEHICLE']
         self.register_buffer(

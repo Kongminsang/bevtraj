@@ -2,6 +2,7 @@ import math
 import copy
 import pickle
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,9 @@ import torch.nn.functional as F
 from unitraj.models.bevtraj.linear import build_mlp, MLP, FFN
 from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to_ego
 from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA
+
+
+MODEL_DIR = Path(__file__).resolve().parent
 
 
 class QueryConditionedDynamics(nn.Module):
@@ -180,7 +184,7 @@ class BDA_ENC(BEVDeformableAggregation):
         self.anchor_file_name = config['anchor_file_name']
 
         if self.use_anchor_points:
-            file_path = 'unitraj/models/bevtraj/' + self.anchor_file_name
+            file_path = MODEL_DIR / self.anchor_file_name
             with open(file_path, 'rb') as f:
                 anchors = pickle.load(f)
             self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
@@ -307,13 +311,11 @@ class BDA_DEC(BEVDeformableAggregation):
             for _ in range(self.config['num_bda_layers'])
         ])
 
-        file_path = 'unitraj/models/bevtraj/cluster_256_center_dict_6s.pkl'
-        # file_path = 'unitraj/models/bevtraj/cluster_64_center_dict_6s.pkl'
-        # file_path = 'unitraj/models/bevtraj/cluster_32_center_dict_6s.pkl'
+        self.anchor_file_name = config['anchor_file_name']
+        file_path = MODEL_DIR / self.anchor_file_name
         with open(file_path, 'rb') as f:
             anchors = pickle.load(f)
         self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
-        # self.anchors = nn.Parameter(torch.from_numpy(anchors['VEHICLE']).float())
 
         # Keep one BDA token per dense anchor. SGCP later compresses this bank into
         # the configured number of trajectory modes.
@@ -321,8 +323,6 @@ class BDA_DEC(BEVDeformableAggregation):
         self.ba_query_dec = nn.Parameter(
             torch.zeros(self.num_ba_query, self.D), requires_grad=True
         )
-        # self.ba_query_dec = nn.Parameter(torch.zeros(32, self.D), requires_grad=True) # kong_fixme
-        # self.num_ba_query = 32
 
     def build_anchor_relation_feat(self, ref_pos_target, tc_dyn):
         eps = 1e-3
