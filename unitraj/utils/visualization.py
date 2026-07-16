@@ -205,6 +205,7 @@ def visualize_prediction(batch, prediction, draw_index=0,
     curr_traj = batch['obj_trajs'][draw_index][:, -1].cpu().numpy()
 
     pred_future_prob = prediction['predicted_probability'][draw_index].detach().cpu().numpy()
+    initial_pred_future_traj = prediction['initial_predicted_trajectory'][draw_index].detach().cpu().numpy()
     pred_future_traj = prediction['predicted_trajectory'][draw_index].detach().cpu().numpy()
     dense_future_pred = prediction['dense_future_pred'][draw_index].detach().cpu().numpy()
     goal_position = prediction['goal_position'][:, draw_index].detach().cpu().numpy()
@@ -251,6 +252,7 @@ def visualize_prediction(batch, prediction, draw_index=0,
     # -----------------------------
     for vis_i, mode_idx in enumerate(mode_indices):
 
+        initial_traj = initial_pred_future_traj[mode_idx][:, :2]
         traj = pred_future_traj[mode_idx][:, :2]
         prob = pred_future_prob[mode_idx]
 
@@ -263,6 +265,16 @@ def visualize_prediction(batch, prediction, draw_index=0,
         rgba_colors = time_cmap(time_colors)
         rgba_colors[:, :3] = base_color[:3]   # overwrite RGB per mode
         rgba_colors[:, 3] = alpha
+
+        ax.scatter(
+            initial_traj[:, 0], initial_traj[:, 1],
+            s=35,
+            marker='o',
+            facecolors='none',
+            edgecolors=rgba_colors,
+            linewidths=0.8,
+            zorder=9
+        )
 
         ax.scatter(
             traj[:, 0], traj[:, 1],

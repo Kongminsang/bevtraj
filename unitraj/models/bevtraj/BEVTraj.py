@@ -136,6 +136,7 @@ class BEVTraj(BaseModel):
         
         last_logit = output['predicted_probability'][-1]
         last_prob = F.softmax(last_logit, dim=-1)
+        initial_traj = output['predicted_trajectory'][0].permute(2, 0, 1, 3)
         last_traj = output['predicted_trajectory'][-1].permute(2, 0, 1, 3)
 
         anchor_pos = output['anchor_pos']
@@ -143,9 +144,11 @@ class BEVTraj(BaseModel):
         if is_validation:
             last_traj, last_prob, ret_idxs = batch_nms(last_traj, last_prob, dist_thresh=2.5, num_ret_modes=10)
             batch_idx = torch.arange(B, device=ret_idxs.device)[:, None]
+            initial_traj = initial_traj[batch_idx, ret_idxs]
             goal_position = anchor_pos[batch_idx, ret_idxs].permute(1, 0, 2).contiguous()
         
         prediction = {'predicted_probability': last_prob,
+                      'initial_predicted_trajectory': initial_traj,
                       'predicted_trajectory': last_traj,
                       'dense_future_pred': dense_future_pred,
                       'goal_position': goal_position}
