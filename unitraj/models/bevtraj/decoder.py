@@ -162,6 +162,9 @@ class BEVTrajDecoder(nn.Module):
         self.dropout = config['dropout']
         self.L_goal_proposal = config['num_goal_proposal_layers']
         self.goal_attn_temperature = config.get('goal_attn_temperature', 0.25)
+        self.goal_agent_distance_threshold = float(
+            config.get('goal_agent_distance_threshold', 5.0)
+        )
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
@@ -209,6 +212,11 @@ class BEVTrajDecoder(nn.Module):
         self.register_buffer(
             'goal_attn_mask', goal_attn_mask, persistent=False
         )
+        self.register_buffer(
+            'goal_anchor_indices',
+            goal_anchor_indices,
+            persistent=False,
+        )
 
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
@@ -246,6 +254,15 @@ class BEVTrajDecoder(nn.Module):
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
 
         # ============================ Initial Prediction ==============================
+        file_path = 'unitraj/models/bevtraj/trajectory_set_256.pkl'
+        with open(file_path, 'rb') as f:
+            trajectory_set = pickle.load(f)['VEHICLE']
+        self.register_buffer(
+            'trajectory_set',
+            torch.from_numpy(trajectory_set).float(),
+            persistent=False,
+        )
+
         self.get_query_scale_itp = MLP(self.D, self.query_scale_dims, self.query_scale_dims, 2)
         self.norm_l1 = nn.ModuleList([nn.LayerNorm(self.D) for _ in range(3)])
         
@@ -334,8 +351,11 @@ class BEVTrajDecoder(nn.Module):
         tc_dyn,
         ego_dyn,
         scene_context,
+        agent_history,
+        target_idx,
         scene_key_padding_mask=None,
     ):
+        # ====================== BDA anchor-token encoding ======================
         bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
         B = bda_token.size(0)
 
@@ -345,17 +365,54 @@ class BEVTrajDecoder(nn.Module):
         key = torch.cat([bda_token, bda_pos_embed], dim=-1).permute(1, 0, 2)
         value = bda_token.permute(1, 0, 2)
 
+        # ============== Mode-wise agent mask from valid history ===============
+        agent_history_pos = agent_history['positions']
+        agent_history_mask = agent_history['valid_mask'].bool()
+        num_agents = scene_context.size(0)
+        batch_idx = torch.arange(B, device=target_idx.device)
+
+        # An agent belongs to a mode when any of its valid past positions is
+        # close to any anchor in that mode. Process one mode at a time to avoid
+        # materializing a large [B, K, N, t, anchors_per_mode] distance tensor.
+        history_pos_fp32 = agent_history_pos.float()
+        distance_threshold_sq = self.goal_agent_distance_threshold ** 2
+        agents_in_mode = []
+        goal_cluster_anchors = self.bda_sgcp.anchors[
+            self.goal_anchor_indices
+        ].float()
+        for mode_anchors in goal_cluster_anchors:
+            distance_sq = (
+                history_pos_fp32.unsqueeze(-2) - mode_anchors
+            ).square().sum(dim=-1)
+            close_at_valid_time = (
+                distance_sq.amin(dim=-1) <= distance_threshold_sq
+            ) & agent_history_mask
+            agents_in_mode.append(close_at_valid_time.any(dim=-1))
+        agents_in_mode = torch.stack(agents_in_mode, dim=1)  # [B, K, N]
+
+        # The target agent is useful for every proposal mode regardless of its
+        # distance to the cluster. Padding remains controlled independently by
+        # scene_key_padding_mask below.
+        agents_in_mode[batch_idx, :, target_idx.long()] = True
+        goal_scene_attn_mask = ~agents_in_mode
+        goal_scene_attn_mask = goal_scene_attn_mask[:, None].expand(
+            -1, self.num_heads, -1, -1
+        ).reshape(B * self.num_heads, self.K, num_agents)
+
+        # ================= Mode-specific scene cross-attention =================
         learned_query = self.goal_query.expand(-1, B, -1)
         mode_query = self.goal_scene_norm(
             self.goal_scene_cross_attn(
                 query=learned_query,
                 key=scene_context,
                 value=scene_context,
+                attn_mask=goal_scene_attn_mask,
                 key_padding_mask=scene_key_padding_mask,
                 need_weights=False,
             )[0] + learned_query
         )
 
+        # ================= Cluster-restricted BDA refinement ==================
         for layer_idx, layer in enumerate(self.goal_proposal):
             residual = mode_query
             mode_query = layer['norm1'](
@@ -377,6 +434,7 @@ class BEVTrajDecoder(nn.Module):
             mode_query = layer['norm2'](cross_query + mode_query)
             mode_query = layer['norm3'](layer['ffn'](mode_query))
 
+        # =================== Goal aggregation and output heads =================
         # Sharpen the differentiable attention distribution for a goal position
         # closer to the highest-scoring anchor. Compute in fp32 for AMP stability.
         tempered_log_attn = (
@@ -584,8 +642,6 @@ class BEVTrajDecoder(nn.Module):
         M, B, _ = mode_query.shape
 
         # ===================== mode localization branch =====================
-        query_scale = self.get_query_scale_itp(mode_query)
-
         mode_embed = self.norm_l1[0](
             self.context_cross_attn_l1(
                 query=mode_query, key=scene_context, value=scene_context
@@ -599,19 +655,44 @@ class BEVTrajDecoder(nn.Module):
             ego_dyn['ego_cos'],
         )
 
-        anchor_pos = target_to_ego(
-            anchor_pos, trans_x, trans_y, rot_sin, rot_cos
-        ).permute(1, 0, 2)  # [M, B, 2] (ego coord for BEV cross-attn)
+        # Select the trajectory template whose endpoint is closest to each goal.
+        endpoint_distance = (
+            anchor_pos[:, :, None] - self.trajectory_set[None, None, :, -1]
+        ).square().sum(dim=-1)
+        trajectory_idx = endpoint_distance.argmin(dim=-1)
+        ref_trajectory = self.trajectory_set[trajectory_idx]  # [B, M, L, 2]
+
+        # BEV references use the ego frame.
+        num_waypoints = ref_trajectory.size(2)
+        ref_trajectory = target_to_ego(
+            ref_trajectory.reshape(B, M * num_waypoints, 2),
+            trans_x,
+            trans_y,
+            rot_sin,
+            rot_cos,
+        ).reshape(B, M, num_waypoints, 2).permute(1, 0, 2, 3)
+
+        # Expand the mode feature into 12 waypoint queries and identify them with
+        # the time PE at the end of each five-step block (0.5s, ..., 6.0s).
+        steps_per_waypoint = self.T // num_waypoints
+        waypoint_time_pe = self.build_time_pe(B, M, mode_embed.dtype)[
+            steps_per_waypoint - 1::steps_per_waypoint
+        ]
+        waypoint_time_pe = waypoint_time_pe.reshape(
+            num_waypoints, B, M, self.D
+        ).permute(2, 1, 0, 3)
+        mode_embed = mode_embed.unsqueeze(2) + waypoint_time_pe
+        query_scale = self.get_query_scale_itp(mode_embed)
 
         mode_embed = self.norm_l1[1](
             self.bev_cross_attn_l1(
                 dec_embed=mode_embed,
                 bev_feat=bev_feat,
                 query_scale=query_scale,
-                ref_points=anchor_pos,
+                ref_points=ref_trajectory,
             )
         )
-        mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))  # [M,B,D]
+        mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))  # [M,B,12,D]
 
         # ===================== state consistency branch =====================
         t = (self.future_time * self.dt + 0.1).to(
@@ -634,11 +715,14 @@ class BEVTrajDecoder(nn.Module):
         state_pred = self.state_reg_l1(state_query).permute(1, 0, 2).contiguous()
 
         # ===================== hybrid coupling =====================
-        mode_bt = mode_embed.permute(1, 0, 2).unsqueeze(2)  # [B,M,1,D]
-        state_bt = state_query.permute(1, 0, 2).unsqueeze(1)  # [B,1,T,D]
+        mode_bt = mode_embed.permute(1, 0, 2, 3).unsqueeze(3)
+        state_bt = state_query.permute(1, 0, 2).reshape(
+            B, 1, num_waypoints, steps_per_waypoint, self.D
+        )
 
-        dec_embed_T = mode_bt + state_bt  # [B,M,T,D]
-        dec_embed_T = dec_embed_T.permute(1, 0, 2, 3).contiguous()  # [M,B,T,D]
+        dec_embed_T = mode_bt + state_bt  # [B,M,12,5,D]
+        dec_embed_T = dec_embed_T.reshape(B, M, self.T, self.D)
+        dec_embed_T = dec_embed_T.permute(1, 0, 2, 3).contiguous()
 
         # ===================== trajectory prediction =====================
         out_dist = self.motion_reg_l1(dec_embed_T)  # [M,B,T,5]
@@ -667,7 +751,8 @@ class BEVTrajDecoder(nn.Module):
 
         dense_future_pred = kwargs.get('dense_future_pred')
         obj_valid_mask = kwargs.get('obj_valid_mask')
-        target_idx = kwargs.get('target_idx')
+        target_idx = kwargs['target_idx']
+        agent_history = kwargs['agent_history']
 
         scene_context_repeat = scene_context.unsqueeze(2).repeat(1, 1, self.T, 1)
         scene_context_repeat = scene_context_repeat.permute(1, 0, 2, 3).reshape(n, B * self.T, -1)
@@ -685,6 +770,8 @@ class BEVTrajDecoder(nn.Module):
                 tc_dyn,
                 ego_dyn,
                 scene_context,
+                agent_history,
+                target_idx,
                 scene_key_padding_mask=scene_key_padding_mask,
             )
         anchor_pos = goal_position.permute(1, 0, 2).contiguous()

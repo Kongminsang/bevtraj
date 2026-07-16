@@ -209,6 +209,7 @@ MODEL:
         dropout: 0.1
         num_goal_proposal_layers: 2
         goal_attn_temperature: 0.25
+        goal_agent_distance_threshold: 5.0  # meters in target-centric coordinates
         num_decoder_layers: 6
         num_heads: 16
         score_time_stride_late_layers: 4
@@ -234,9 +235,12 @@ MODEL:
         deform_cross_attn:
             dim_head: 64
             num_heads: 8
-            num_sampling_points: 16
+            num_sampling_points: 24
             dropout: 0.1
             grid_size: *grid_size
+            multi_range: true
+            time_scale_range: [0.5, 2.0]
+            offset_group_scales: [0.5, 1.0, 2.0]
         deform_cross_attn_itr:
             dim_head: 64
             num_heads: 8

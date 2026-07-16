@@ -101,7 +101,8 @@ class BEVTraj(BaseModel):
     def forward(self, batch, is_validation):
         traj_data = batch['traj_data']['input_dict']
         # bev_feat_raw = batch['bev_feat']
-        ec_dynamics, tc_dynamics, ego_dynamics = self.prepare_decoder_input(traj_data)
+        ec_dynamics, tc_dynamics, ego_dynamics, agent_history = \
+            self.prepare_decoder_input(traj_data)
         
         # encoding
         pre_encoder_emb = self.pre_encoder(traj_data)
@@ -126,6 +127,7 @@ class BEVTraj(BaseModel):
             dense_future_pred=dense_future_pred,
             obj_valid_mask=obj_valid_mask,
             target_idx=traj_data['track_index_to_predict'],
+            agent_history=agent_history,
         )
         
         # get loss
@@ -201,8 +203,21 @@ class BEVTraj(BaseModel):
             'ego_sin': agents_in[B_idx, ego_idx, -1, -6:-5], # (B, 1)
             'ego_cos': agents_in[B_idx, ego_idx, -1, -5:-4], # (B, 1)
         }
+
+        # Past positions are already expressed in the current target-agent frame
+        # by the dataset. Keep the per-timestamp mask so invalid zero-padded
+        # positions cannot be mistaken for agents near a goal-anchor cluster.
+        agent_history = {
+            'positions': traj_data['obj_trajs_pos'][..., :2],  # (B, N, t, 2)
+            'valid_mask': traj_data['obj_trajs_mask'].bool(),  # (B, N, t)
+        }
         
-        return ego_centric_dynamics, target_agent_dynamics, ego_dynamics
+        return (
+            ego_centric_dynamics,
+            target_agent_dynamics,
+            ego_dynamics,
+            agent_history,
+        )
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), **self.optimizer_cfg)
