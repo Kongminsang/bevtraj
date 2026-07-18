@@ -260,6 +260,7 @@ class BEVTrajDecoder(nn.Module):
 
         # ============================ Initial Prediction ==============================
         self.trajectory_file_name = config['trajectory_file_name']
+        self.num_waypoints = config['num_waypoints']
         file_path = MODEL_DIR / self.trajectory_file_name
         with open(file_path, 'rb') as f:
             trajectory_set = pickle.load(f)['VEHICLE']
@@ -666,26 +667,26 @@ class BEVTrajDecoder(nn.Module):
             anchor_pos[:, :, None] - self.trajectory_set[None, None, :, -1]
         ).square().sum(dim=-1)
         trajectory_idx = endpoint_distance.argmin(dim=-1)
-        ref_trajectory = self.trajectory_set[trajectory_idx]  # [B, M, L, 2]
+        ref_trajectory = self.trajectory_set[trajectory_idx]  # [B,M,T,2]
 
         # BEV references use the ego frame.
-        num_waypoints = ref_trajectory.size(2)
-        ref_trajectory = target_to_ego(
-            ref_trajectory.reshape(B, M * num_waypoints, 2),
+        steps_per_waypoint = self.T // self.num_waypoints
+        ref_waypoints = ref_trajectory[:, :, steps_per_waypoint - 1::steps_per_waypoint]
+        ref_waypoints = target_to_ego(
+            ref_waypoints.reshape(B, M * self.num_waypoints, 2),
             trans_x,
             trans_y,
             rot_sin,
             rot_cos,
-        ).reshape(B, M, num_waypoints, 2).permute(1, 0, 2, 3)
+        ).reshape(B, M, self.num_waypoints, 2).permute(1, 0, 2, 3)
 
-        # Expand the mode feature into 12 waypoint queries and identify them with
-        # the time PE at the end of each five-step block (0.5s, ..., 6.0s).
-        steps_per_waypoint = self.T // num_waypoints
+        # Identify waypoint queries with the time PE at the end of each temporal
+        # block (with the default 12 waypoints: 0.5s, ..., 6.0s).
         waypoint_time_pe = self.build_time_pe(B, M, mode_embed.dtype)[
             steps_per_waypoint - 1::steps_per_waypoint
         ]
         waypoint_time_pe = waypoint_time_pe.reshape(
-            num_waypoints, B, M, self.D
+            self.num_waypoints, B, M, self.D
         ).permute(2, 1, 0, 3)
         mode_embed = mode_embed.unsqueeze(2) + waypoint_time_pe
         query_scale = self.get_query_scale_itp(mode_embed)
@@ -695,10 +696,16 @@ class BEVTrajDecoder(nn.Module):
                 dec_embed=mode_embed,
                 bev_feat=bev_feat,
                 query_scale=query_scale,
-                ref_points=ref_trajectory,
+                ref_points=ref_waypoints,
             )
         )
-        mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))  # [M,B,12,D]
+        mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))
+
+        # The two candidates share localization features and differ only in
+        # their initial XY trajectory, so expand modes after BEV localization.
+        mode_embed = mode_embed.repeat_interleave(2, dim=0)
+        ref_trajectory = ref_trajectory.repeat_interleave(2, dim=1)
+        M = mode_embed.size(0)
 
         # ===================== state consistency branch =====================
         t = (self.future_time * self.dt + 0.1).to(
@@ -723,16 +730,28 @@ class BEVTrajDecoder(nn.Module):
         # ===================== hybrid coupling =====================
         mode_bt = mode_embed.permute(1, 0, 2, 3).unsqueeze(3)
         state_bt = state_query.permute(1, 0, 2).reshape(
-            B, 1, num_waypoints, steps_per_waypoint, self.D
+            B, 1, self.num_waypoints, steps_per_waypoint, self.D
         )
 
-        dec_embed_T = mode_bt + state_bt  # [B,M,12,5,D]
+        dec_embed_T = mode_bt + state_bt
         dec_embed_T = dec_embed_T.reshape(B, M, self.T, self.D)
         dec_embed_T = dec_embed_T.permute(1, 0, 2, 3).contiguous()
 
         # ===================== trajectory prediction =====================
         out_dist = self.motion_reg_l1(dec_embed_T)  # [M,B,T,5]
         out_vel = self.motion_vel_l1(dec_embed_T)  # [M,B,T,2]
+
+        # Candidate ordering is [regressed, predefined] for every proposal
+        # mode. Keep the learned Gaussian scale/correlation parameters on both
+        # candidates, replacing only the predefined candidate's XY mean.
+        predefined_xy = ref_trajectory.permute(1, 0, 2, 3).to(
+            dtype=out_dist.dtype
+        ).contiguous()
+        use_predefined = (
+            torch.arange(M, device=out_dist.device) % 2 == 1
+        ).view(M, 1, 1, 1)
+        out_xy = torch.where(use_predefined, predefined_xy, out_dist[..., :2])
+        out_dist = torch.cat([out_xy, out_dist[..., 2:]], dim=-1)
         mode_prob = self.score_predicted_trajectory(
             dec_embed=dec_embed_T,
             pred_traj=out_dist,
@@ -798,6 +817,10 @@ class BEVTrajDecoder(nn.Module):
                 target_idx=target_idx,
             )
             # self.initial_prediction(mode_query, scene_context, bev_feat, anchor_pos, ego_dyn)
+
+        # Initial prediction expands each goal proposal into a regressed/template
+        # pair, so expose matching first-stage anchors to EDA and validation NMS.
+        anchor_pos = anchor_pos.repeat_interleave(2, dim=1)
         
         mode_probs = [init_mode_prob]
         pred_trajs = [init_pred_traj.permute(0, 2, 1, 3)]

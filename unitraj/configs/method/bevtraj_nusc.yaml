@@ -215,7 +215,8 @@ MODEL:
         score_time_stride_late_layers: 4
         score_time_full_refine_layers: 1
         goal_anchor_file_name: 'cluster_10mode_64anchors_detailed_6s.pkl'
-        trajectory_file_name: 'trajectory_set_256.pkl'
+        trajectory_file_name: 'trajectory_set_256_60.pkl'
+        num_waypoints: 12
 
         bda_dec:
             past_len: *past_len
