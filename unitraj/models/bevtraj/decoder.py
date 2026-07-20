@@ -442,8 +442,9 @@ class BEVTrajDecoder(nn.Module):
             mode_query = layer['norm3'](layer['ffn'](mode_query))
 
         # =================== Goal aggregation and output heads =================
-        # Sharpen the differentiable attention distribution for a goal position
-        # closer to the highest-scoring anchor. Compute in fp32 for AMP stability.
+        # Select exactly one anchor in the forward pass while keeping the soft
+        # attention path as a straight-through gradient surrogate. Compute the
+        # attention distribution in fp32 for AMP stability.
         tempered_log_attn = (
             final_cross_attn.float().clamp_min(1e-12).log()
             / self.goal_attn_temperature
@@ -452,9 +453,23 @@ class BEVTrajDecoder(nn.Module):
             self.goal_attn_mask[None], float('-inf')
         )
         normalized_attn = tempered_log_attn.softmax(dim=-1)
-        goal_position = (
+
+        hard_anchor_idx = tempered_log_attn.argmax(dim=-1)  # [B, K]
+        hard_goal_position = bda_pos.gather(
+            dim=1,
+            index=hard_anchor_idx.unsqueeze(-1).expand(
+                -1, -1, bda_pos.size(-1)
+            ),
+        )  # [B, K, 2]
+        soft_goal_position = (
             bda_pos[:, None] * normalized_attn.unsqueeze(-1)
-        ).sum(dim=2).permute(1, 0, 2).contiguous()
+        ).sum(dim=2)  # [B, K, 2]
+
+        # Forward value is hard_goal_position; backward follows soft_goal_position.
+        goal_position = (
+            hard_goal_position
+            + (soft_goal_position - soft_goal_position.detach())
+        ).permute(1, 0, 2).contiguous()
 
         goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
         return mode_query, goal_position, goal_FDE
