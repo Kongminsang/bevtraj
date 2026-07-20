@@ -98,7 +98,7 @@ class BEVTraj(BaseModel):
         
         print("BEVTraj model initialized.")
         
-    def forward(self, batch, is_validation):
+    def forward(self, batch, is_validation, current_epoch=0):
         traj_data = batch['traj_data']['input_dict']
         # bev_feat_raw = batch['bev_feat']
         ec_dynamics, tc_dynamics, ego_dynamics, agent_history = \
@@ -132,7 +132,7 @@ class BEVTraj(BaseModel):
         
         # get loss
         output['dense_future_pred'] = dense_future_pred
-        loss = self.get_loss(traj_data, output)
+        loss = self.get_loss(traj_data, output, current_epoch=current_epoch)
         
         last_logit = output['predicted_probability'][-1]
         last_prob = F.softmax(last_logit, dim=-1)
@@ -156,7 +156,7 @@ class BEVTraj(BaseModel):
         return prediction, loss
 
     
-    def get_loss(self, traj_data, prediction):
+    def get_loss(self, traj_data, prediction, current_epoch=0):
         ground_truth = []
         decoder_gt = torch.cat(
             [traj_data['center_gt_trajs'], traj_data['center_gt_trajs_mask'].unsqueeze(-1)],
@@ -165,7 +165,13 @@ class BEVTraj(BaseModel):
         ground_truth.append(decoder_gt)
         dense_future_gt = {'obj_trajs_future_state': traj_data['obj_trajs_future_state'], 'obj_trajs_future_mask': traj_data['obj_trajs_future_mask']}
         ground_truth.append(dense_future_gt)
-        loss = self.criterion(prediction, ground_truth, traj_data['center_gt_final_valid_idx'], traj_data)
+        loss = self.criterion(
+            prediction,
+            ground_truth,
+            traj_data['center_gt_final_valid_idx'],
+            traj_data,
+            current_epoch=current_epoch,
+        )
         
         return loss
     
@@ -229,11 +235,19 @@ class BEVTraj(BaseModel):
         return [optimizer], [scheduler]
     
     def training_step(self, batch, batch_idx):
-        prediction, loss = self.forward(batch, is_validation=False)
+        prediction, loss = self.forward(
+            batch,
+            is_validation=False,
+            current_epoch=self.current_epoch,
+        )
         self.log_info(batch['traj_data'], batch_idx, prediction, status='train')
         return loss
 
     def validation_step(self, batch, batch_idx):
-        prediction, loss = self.forward(batch, is_validation=True)
+        prediction, loss = self.forward(
+            batch,
+            is_validation=True,
+            current_epoch=self.current_epoch,
+        )
         self.log_info(batch['traj_data'], batch_idx, prediction, status='val')
         return loss
