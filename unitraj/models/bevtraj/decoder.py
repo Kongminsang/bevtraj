@@ -165,10 +165,9 @@ class BEVTrajDecoder(nn.Module):
         self.spa_pos_T = config['spa_pos_T']
         self.dropout = config['dropout']
         self.L_goal_proposal = config['num_goal_proposal_layers']
+        if self.L_goal_proposal <= 0:
+            raise ValueError('num_goal_proposal_layers must be positive')
         self.goal_attn_temperature = config.get('goal_attn_temperature', 0.25)
-        self.goal_agent_distance_threshold = float(
-            config.get('goal_agent_distance_threshold', 5.0)
-        )
         self.use_goal_flow_context = bool(
             config.get('use_goal_flow_context', False)
         )
@@ -341,42 +340,48 @@ class BEVTrajDecoder(nn.Module):
                 2,
             )
             self.goal_flow_norm = nn.LayerNorm(self.D)
-            self.goal_flow_fuse = MLP(self.D * 2, self.D, self.D, 2)
-            self.goal_flow_gate = nn.Linear(self.D * 2, 1)
-            nn.init.zeros_(self.goal_flow_gate.weight)
-            nn.init.constant_(self.goal_flow_gate.bias, -2.0)
 
-        self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
-        nn.init.xavier_uniform_(self.goal_query)
+        # BDA and traffic-flow tokens describe different kinds of evidence.
+        # Keep a dedicated mode query for each source so neither representation
+        # has to decode a token in which the two modalities were mixed early.
+        self.goal_bda_query = nn.Parameter(torch.empty(self.K, 1, self.D))
+        nn.init.xavier_uniform_(self.goal_bda_query)
+        if self.use_goal_flow_context:
+            self.goal_flow_query = nn.Parameter(
+                torch.empty(self.K, 1, self.D)
+            )
+            nn.init.xavier_uniform_(self.goal_flow_query)
 
-        self.goal_scene_cross_attn = nn.MultiheadAttention(
-            self.D, self.num_heads, dropout=self.dropout
-        )
-        self.goal_scene_norm = nn.LayerNorm(self.D)
-
-        # BDA anchor tokens are shared across modes. The attention mask gives each
-        # proposal query access only to its own spatial cluster.
+        # Both branches use the same cluster mask, but have completely separate
+        # cross-attention, self-attention, and FFN parameters.
         self.goal_proposal = nn.ModuleList()
         for _ in range(self.L_goal_proposal):
-            self.goal_proposal.append(nn.ModuleDict({
-                'self_attn': nn.MultiheadAttention(
+            goal_layer = {
+                'bda_cross_attn': nn.MultiheadAttention(
                     self.D, self.num_heads, dropout=self.dropout
                 ),
-                'norm1': nn.LayerNorm(self.D),
-
-                'cross_attn': nn.MultiheadAttention(
-                    self.D * 2,
-                    self.num_heads,
-                    dropout=self.dropout,
-                    kdim=self.D * 2,
-                    vdim=self.D,
+                'bda_cross_norm': nn.LayerNorm(self.D),
+                'bda_self_attn': nn.MultiheadAttention(
+                    self.D, self.num_heads, dropout=self.dropout
                 ),
-                'q_proj': MLP(self.D * 2, self.D, self.D, 2),
-                'norm2': nn.LayerNorm(self.D),
-
-                'ffn': FFN(self.D, self.ffn_D, 2),
-                'norm3': nn.LayerNorm(self.D),
-            }))
+                'bda_self_norm': nn.LayerNorm(self.D),
+                'bda_ffn': FFN(self.D, self.ffn_D, 2),
+                'bda_ffn_norm': nn.LayerNorm(self.D),
+            }
+            if self.use_goal_flow_context:
+                goal_layer.update({
+                    'flow_cross_attn': nn.MultiheadAttention(
+                        self.D, self.num_heads, dropout=self.dropout
+                    ),
+                    'flow_cross_norm': nn.LayerNorm(self.D),
+                    'flow_self_attn': nn.MultiheadAttention(
+                        self.D, self.num_heads, dropout=self.dropout
+                    ),
+                    'flow_self_norm': nn.LayerNorm(self.D),
+                    'flow_ffn': FFN(self.D, self.ffn_D, 2),
+                    'flow_ffn_norm': nn.LayerNorm(self.D),
+                })
+            self.goal_proposal.append(nn.ModuleDict(goal_layer))
         self.goal_FDE = MLP(self.D, self.D, 1, 2)
 
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
@@ -786,125 +791,93 @@ class BEVTrajDecoder(nn.Module):
         ec_dyn,
         tc_dyn,
         ego_dyn,
-        scene_context,
         agent_history,
         target_idx,
-        scene_key_padding_mask=None,
     ):
         # ====================== BDA anchor-token encoding ======================
         bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
         B = bda_token.size(0)
 
-        # Anchor-local traffic flow: each dense anchor uses the precomputed
-        # arrival heading as its local +x direction. Fusing before construction
-        # of key/value lets the cluster-restricted attention both score and
-        # retrieve this context without repeating work for overlapping modes.
+        # Anchor-local traffic flow remains a separate token stream. Each dense
+        # anchor uses the precomputed arrival heading as its local +x direction.
         if self.use_goal_flow_context:
-            goal_flow_token, goal_flow_present = (
-                self.build_goal_anchor_flow_tokens(
-                    agent_history,
-                    target_idx,
-                    output_dtype=bda_token.dtype,
-                )
-            )
-            flow_fuse_input = torch.cat(
-                [bda_token, goal_flow_token], dim=-1
-            )
-            goal_flow_delta = self.goal_flow_fuse(flow_fuse_input)
-            goal_flow_gate = torch.sigmoid(
-                self.goal_flow_gate(flow_fuse_input)
-            )
-            bda_token = bda_token + (
-                goal_flow_present.to(bda_token.dtype)
-                * goal_flow_gate
-                * goal_flow_delta
+            goal_flow_token, _ = self.build_goal_anchor_flow_tokens(
+                agent_history,
+                target_idx,
+                output_dtype=bda_token.dtype,
             )
 
+        # Add the anchor position to each modality independently. This preserves
+        # exact anchor identity without concatenating BDA and flow information.
         bda_pos_embed = gen_sineembed_for_position(
             bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
-        )
-        key = torch.cat([bda_token, bda_pos_embed], dim=-1).permute(1, 0, 2)
-        value = bda_token.permute(1, 0, 2)
+        ).to(dtype=bda_token.dtype)
+        bda_key = (bda_token + bda_pos_embed).permute(1, 0, 2)
+        bda_value = bda_token.permute(1, 0, 2)
+        if self.use_goal_flow_context:
+            flow_key = (goal_flow_token + bda_pos_embed).permute(1, 0, 2)
+            flow_value = goal_flow_token.permute(1, 0, 2)
 
-        # ============== Mode-wise agent mask from valid history ===============
-        agent_history_pos = agent_history['positions']
-        agent_history_mask = agent_history['valid_mask'].bool()
-        num_agents = scene_context.size(0)
-        target_idx = target_idx.to(
-            device=agent_history_pos.device, dtype=torch.long
-        )
-        batch_idx = torch.arange(B, device=agent_history_pos.device)
-
-        # An agent belongs to a mode when any of its valid past positions is
-        # close to any anchor in that mode. Process one mode at a time to avoid
-        # materializing a large [B, K, N, t, anchors_per_mode] distance tensor.
-        history_pos_fp32 = agent_history_pos.float()
-        distance_threshold_sq = self.goal_agent_distance_threshold ** 2
-        agents_in_mode = []
-        goal_cluster_anchors = self.bda_sgcp.anchors[
-            self.goal_anchor_indices
-        ].float()
-        for mode_anchors in goal_cluster_anchors:
-            distance_sq = (
-                history_pos_fp32.unsqueeze(-2) - mode_anchors
-            ).square().sum(dim=-1)
-            close_at_valid_time = (
-                distance_sq.amin(dim=-1) <= distance_threshold_sq
-            ) & agent_history_mask
-            agents_in_mode.append(close_at_valid_time.any(dim=-1))
-        agents_in_mode = torch.stack(agents_in_mode, dim=1)  # [B, K, N]
-
-        # The target agent is useful for every proposal mode regardless of its
-        # distance to the cluster. Padding remains controlled independently by
-        # scene_key_padding_mask below.
-        agents_in_mode[batch_idx, :, target_idx] = True
-        goal_scene_attn_mask = ~agents_in_mode
-        goal_scene_attn_mask = goal_scene_attn_mask[:, None].expand(
-            -1, self.num_heads, -1, -1
-        ).reshape(B * self.num_heads, self.K, num_agents)
-
-        # ================= Mode-specific scene cross-attention =================
-        learned_query = self.goal_query.expand(-1, B, -1)
-        mode_query = self.goal_scene_norm(
-            self.goal_scene_cross_attn(
-                query=learned_query,
-                key=scene_context,
-                value=scene_context,
-                attn_mask=goal_scene_attn_mask,
-                key_padding_mask=scene_key_padding_mask,
-                need_weights=False,
-            )[0] + learned_query
-        )
-
-        # ================= Cluster-restricted BDA refinement ==================
+        # ============== Independent cluster-restricted refinement =============
+        bda_mode_query = self.goal_bda_query.expand(-1, B, -1)
+        if self.use_goal_flow_context:
+            flow_mode_query = self.goal_flow_query.expand(-1, B, -1)
         for layer_idx, layer in enumerate(self.goal_proposal):
-            residual = mode_query
-            mode_query = layer['norm1'](
-                layer['self_attn'](mode_query, mode_query, mode_query)[0] + residual
-            )
-
-            cross_query = torch.cat([mode_query, learned_query], dim=-1)
             is_last_layer = layer_idx == len(self.goal_proposal) - 1
-            cross_query, cross_attn = layer['cross_attn'](
-                cross_query,
-                key,
-                value,
+
+            bda_cross_out, bda_cross_attn = layer['bda_cross_attn'](
+                query=bda_mode_query,
+                key=bda_key,
+                value=bda_value,
                 attn_mask=self.goal_attn_mask,
                 need_weights=is_last_layer,
             )
-            if is_last_layer:
-                final_cross_attn = cross_attn
-            cross_query = layer['q_proj'](cross_query)
-            mode_query = layer['norm2'](cross_query + mode_query)
-            mode_query = layer['norm3'](layer['ffn'](mode_query))
+            bda_mode_query = layer['bda_cross_norm'](
+                bda_mode_query + bda_cross_out
+            )
+            bda_self_out = layer['bda_self_attn'](
+                bda_mode_query, bda_mode_query, bda_mode_query,
+                need_weights=False,
+            )[0]
+            bda_mode_query = layer['bda_self_norm'](
+                bda_mode_query + bda_self_out
+            )
+            bda_mode_query = layer['bda_ffn_norm'](
+                layer['bda_ffn'](bda_mode_query)
+            )
+
+            if self.use_goal_flow_context:
+                flow_cross_out, flow_cross_attn = layer['flow_cross_attn'](
+                    query=flow_mode_query,
+                    key=flow_key,
+                    value=flow_value,
+                    attn_mask=self.goal_attn_mask,
+                    need_weights=is_last_layer,
+                )
+                flow_mode_query = layer['flow_cross_norm'](
+                    flow_mode_query + flow_cross_out
+                )
+                flow_self_out = layer['flow_self_attn'](
+                    flow_mode_query, flow_mode_query, flow_mode_query,
+                    need_weights=False,
+                )[0]
+                flow_mode_query = layer['flow_self_norm'](
+                    flow_mode_query + flow_self_out
+                )
+                flow_mode_query = layer['flow_ffn_norm'](
+                    layer['flow_ffn'](flow_mode_query)
+                )
 
         # =================== Goal aggregation and output heads =================
-        # Sharpen the differentiable attention distribution for a goal position
-        # closer to the highest-scoring anchor. Compute in fp32 for AMP stability.
-        tempered_log_attn = (
-            final_cross_attn.float().clamp_min(1e-12).log()
-            / self.goal_attn_temperature
-        )
+        # Multiplication in probability space becomes addition in log space.
+        # This is more stable under AMP and gives exactly the requested product
+        # of the two same-anchor scores before the tempered softmax.
+        tempered_log_attn = bda_cross_attn.float().clamp_min(1e-12).log()
+        if self.use_goal_flow_context:
+            tempered_log_attn = tempered_log_attn + (
+                flow_cross_attn.float().clamp_min(1e-12).log()
+            )
+        tempered_log_attn = tempered_log_attn / self.goal_attn_temperature
         tempered_log_attn = tempered_log_attn.masked_fill(
             self.goal_attn_mask[None], float('-inf')
         )
@@ -913,8 +886,11 @@ class BEVTrajDecoder(nn.Module):
             bda_pos[:, None] * normalized_attn.unsqueeze(-1)
         ).sum(dim=2).permute(1, 0, 2).contiguous()
 
-        goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
-        return mode_query, goal_position, goal_FDE
+        # Keep the downstream proposal representation BDA-centric. Traffic flow
+        # affects anchor selection through the joint score without being mixed
+        # back into the BDA query representation.
+        goal_FDE = self.goal_FDE(bda_mode_query).squeeze(-1).T
+        return bda_mode_query, goal_position, goal_FDE
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
@@ -1240,10 +1216,6 @@ class BEVTrajDecoder(nn.Module):
         scene_context_repeat = scene_context_repeat.permute(1, 0, 2, 3).reshape(n, B * self.T, -1)
         scene_context = scene_context.permute(1, 0, 2)
 
-        scene_key_padding_mask = None
-        if obj_valid_mask is not None:
-            scene_key_padding_mask = ~obj_valid_mask.bool()
-
         # -------------------Goal Candidate Proposal -----------------
         mode_query, goal_position, goal_FDE = \
             self.goal_candidate_proposal(
@@ -1251,10 +1223,8 @@ class BEVTrajDecoder(nn.Module):
                 ec_dyn,
                 tc_dyn,
                 ego_dyn,
-                scene_context,
                 agent_history,
                 target_idx,
-                scene_key_padding_mask=scene_key_padding_mask,
             )
         anchor_pos = goal_position.permute(1, 0, 2).contiguous()
         anchor_pos_detached = anchor_pos.detach()
