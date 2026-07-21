@@ -8,41 +8,44 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from unitraj.models.bevtraj.linear import build_mlp, MLP, FFN
+from unitraj.models.bevtraj.linear import build_mlp, FFN
+# from unitraj.models.bevtraj.linear import MLP
 from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to_ego
-from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA
+# from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA
 
 
 MODEL_DIR = Path(__file__).resolve().parent
 
 
-class QueryConditionedDynamics(nn.Module):
-    """
-    dynamics: [batch_size, query_num, dyn_dim]
-    query_emb: [batch_size, query_num, query_dim]
-    FiLM: Feature-wise Linear Modulation
-    
-    """
-    def __init__(self, query_dim, hidden_dim):
-        super().__init__()
-        
-        self.modulator = nn.Sequential(
-            nn.Linear(query_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 2 * hidden_dim),
-        )
-        
-        # Initialize the last layer to produce zero modulation at the beginning
-        nn.init.zeros_(self.modulator[-1].weight)
-        nn.init.zeros_(self.modulator[-1].bias)
-        
-        
-    def forward(self, dynamics, query_emb):
-        B, N, _ = query_emb.shape
-        gamma_beta = self.modulator(query_emb) #(B, N, 2 * hidden_dim)
-        gamma, beta = gamma_beta.chunk (2, dim=-1) #(B, N, hidden_dim) each
-        conditioned = (1 + gamma) * dynamics + beta #(B, N, hidden_dim)
-        return conditioned
+# Target-motion ablation: keep the previous conditioning implementation here so
+# it can be restored easily, but do not register or execute it in BDA_DEC.
+# class QueryConditionedDynamics(nn.Module):
+#     """
+#     dynamics: [batch_size, query_num, dyn_dim]
+#     query_emb: [batch_size, query_num, query_dim]
+#     FiLM: Feature-wise Linear Modulation
+#
+#     """
+#     def __init__(self, query_dim, hidden_dim):
+#         super().__init__()
+#
+#         self.modulator = nn.Sequential(
+#             nn.Linear(query_dim, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, 2 * hidden_dim),
+#         )
+#
+#         # Initialize the last layer to produce zero modulation at the beginning
+#         nn.init.zeros_(self.modulator[-1].weight)
+#         nn.init.zeros_(self.modulator[-1].bias)
+#
+#
+#     def forward(self, dynamics, query_emb):
+#         B, N, _ = query_emb.shape
+#         gamma_beta = self.modulator(query_emb) #(B, N, 2 * hidden_dim)
+#         gamma, beta = gamma_beta.chunk (2, dim=-1) #(B, N, hidden_dim) each
+#         conditioned = (1 + gamma) * dynamics + beta #(B, N, hidden_dim)
+#         return conditioned
 
 
 class DeformAttn(nn.Module):
@@ -278,33 +281,36 @@ class BDA_DEC(BEVDeformableAggregation):
     def __init__(self, config, d_model):
         super(BDA_DEC, self).__init__(config, d_model)
 
-        self.t = config['past_len']
-        self.t_D = config['t_dims']
+        # Target-motion ablation: these modules previously injected tc_dyn into
+        # the BDA tokens and positional queries. Keep the implementation as
+        # comments, but aggregate BEV features from anchor positions only.
+        # self.t = config['past_len']
+        # self.t_D = config['t_dims']
 
-        self.dynamics_enc = nn.ModuleDict({
-            'tc': MLP(self.config['target_attr'], self.D, self.D, 2),
-            'tc_q': QueryConditionedDynamics(self.D, self.D),
-            'motion_fuse': MLP(self.D + self.D, self.D, self.D, 3),
-        })
+        # self.dynamics_enc = nn.ModuleDict({
+        #     'tc': MLP(self.config['target_attr'], self.D, self.D, 2),
+        #     'tc_q': QueryConditionedDynamics(self.D, self.D),
+        #     'motion_fuse': MLP(self.D + self.D, self.D, self.D, 3),
+        # })
 
-        self.anchor_enc = nn.ModuleDict({
-            'tc': MLP(self.D, self.D, self.D, 2),
-            'rel': MLP(8, self.D, self.D, 2),
-        })
-        self.tc_temporal_mha = TemporalMHA(self.D, self.config['bda_layer']['num_heads'], self.dropout)
-        self.tc_temporal_norm = nn.LayerNorm(self.D)
-        self.tc_anchor_attn = nn.MultiheadAttention(self.D, self.config['bda_layer']['num_heads'], dropout=self.dropout, batch_first=True)
-        self.tc_anchor_norm = nn.LayerNorm(self.D)
-        self.history_time_embedding_mlp = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.GELU(),
-            nn.Linear(64, self.D),
-        )
-        self.register_buffer('history_time', torch.arange(self.t).float().unsqueeze(-1))
-        self.history_dt = config.get('dt', 0.1)
-        self.history_time_alpha = nn.Parameter(torch.tensor(1.0))
-        self.motion_to_query_pos = MLP(self.D, self.D, self.D, 2)
-        self.motion_gate = MLP(self.D + self.D, self.D, self.D, 2)
+        # self.anchor_enc = nn.ModuleDict({
+        #     'tc': MLP(self.D, self.D, self.D, 2),
+        #     'rel': MLP(8, self.D, self.D, 2),
+        # })
+        # self.tc_temporal_mha = TemporalMHA(self.D, self.config['bda_layer']['num_heads'], self.dropout)
+        # self.tc_temporal_norm = nn.LayerNorm(self.D)
+        # self.tc_anchor_attn = nn.MultiheadAttention(self.D, self.config['bda_layer']['num_heads'], dropout=self.dropout, batch_first=True)
+        # self.tc_anchor_norm = nn.LayerNorm(self.D)
+        # self.history_time_embedding_mlp = nn.Sequential(
+        #     nn.Linear(1, 64),
+        #     nn.GELU(),
+        #     nn.Linear(64, self.D),
+        # )
+        # self.register_buffer('history_time', torch.arange(self.t).float().unsqueeze(-1))
+        # self.history_dt = config.get('dt', 0.1)
+        # self.history_time_alpha = nn.Parameter(torch.tensor(1.0))
+        # self.motion_to_query_pos = MLP(self.D, self.D, self.D, 2)
+        # self.motion_gate = MLP(self.D + self.D, self.D, self.D, 2)
 
         self.bda_layers = nn.ModuleList([
             BDALayer_DEC(self.config['bda_layer'], self.D, self.grid_size)
@@ -324,38 +330,38 @@ class BDA_DEC(BEVDeformableAggregation):
             torch.zeros(self.num_ba_query, self.D), requires_grad=True
         )
 
-    def build_anchor_relation_feat(self, ref_pos_target, tc_dyn):
-        eps = 1e-3
+    # def build_anchor_relation_feat(self, ref_pos_target, tc_dyn):
+    #     eps = 1e-3
 
-        dx = ref_pos_target[..., 0]
-        dy = ref_pos_target[..., 1]
-        r = torch.sqrt(dx.square() + dy.square() + eps)
-        sin_theta = dy / r
-        cos_theta = dx / r
+    #     dx = ref_pos_target[..., 0]
+    #     dy = ref_pos_target[..., 1]
+    #     r = torch.sqrt(dx.square() + dy.square() + eps)
+    #     sin_theta = dy / r
+    #     cos_theta = dx / r
 
-        target_vel = tc_dyn[:, -1, 2:4]
-        speed = torch.norm(target_vel, dim=-1, keepdim=True)
-        heading = target_vel / speed.clamp_min(eps)
-        heading = heading.unsqueeze(1).expand(-1, self.num_ba_query, -1)
-        heading_perp = torch.stack([-heading[..., 1], heading[..., 0]], dim=-1)
+    #     target_vel = tc_dyn[:, -1, 2:4]
+    #     speed = torch.norm(target_vel, dim=-1, keepdim=True)
+    #     heading = target_vel / speed.clamp_min(eps)
+    #     heading = heading.unsqueeze(1).expand(-1, self.num_ba_query, -1)
+    #     heading_perp = torch.stack([-heading[..., 1], heading[..., 0]], dim=-1)
 
-        longi = (ref_pos_target * heading).sum(dim=-1)
-        lateral = (ref_pos_target * heading_perp).sum(dim=-1)
-        time_to_reach = r / speed.clamp_min(eps)
+    #     longi = (ref_pos_target * heading).sum(dim=-1)
+    #     lateral = (ref_pos_target * heading_perp).sum(dim=-1)
+    #     time_to_reach = r / speed.clamp_min(eps)
 
-        rel_feat = torch.stack([
-            dx, dy, r,
-            sin_theta, cos_theta,
-            longi, lateral,
-            time_to_reach.squeeze(-1),
-        ], dim=-1)
-        return rel_feat
+    #     rel_feat = torch.stack([
+    #         dx, dy, r,
+    #         sin_theta, cos_theta,
+    #         longi, lateral,
+    #         time_to_reach.squeeze(-1),
+    #     ], dim=-1)
+    #     return rel_feat
 
-    def build_history_time_pe(self, batch_size, dtype, device):
-        t = (self.history_time * self.history_dt).to(device=device, dtype=dtype)
-        pe = self.history_time_embedding_mlp(t)  # [t, D]
-        pe = pe.unsqueeze(1).repeat(1, batch_size, 1)  # [t, B, D]
-        return self.history_time_alpha * pe
+    # def build_history_time_pe(self, batch_size, dtype, device):
+    #     t = (self.history_time * self.history_dt).to(device=device, dtype=dtype)
+    #     pe = self.history_time_embedding_mlp(t)  # [t, D]
+    #     pe = pe.unsqueeze(1).repeat(1, batch_size, 1)  # [t, B, D]
+    #     return self.history_time_alpha * pe
 
     def forward(self, bev_feat, ec_dyn, tc_dyn, ego_dyn):
         B = bev_feat.shape[0]
@@ -372,41 +378,44 @@ class BDA_DEC(BEVDeformableAggregation):
         )
         ref_pos = target_to_ego(ref_pos_target, trans_x, trans_y, rot_sin, rot_cos)
 
-        # =============================== prototype ================================
-        # tc features build query semantics, while ec coordinates remain responsible
-        # for BEV lookup through ref_pos. Before encoding anchor positions, explicitly
-        # describe how each anchor relates to current target motion.
-
-        tc_step_feat = self.dynamics_enc['tc'](tc_dyn)  # (B, t, D)
-        tc_time_pe = self.build_history_time_pe(B, tc_step_feat.dtype, tc_step_feat.device)
-        tc_step_feat_temporal = self.tc_temporal_mha(
-            tc_step_feat.permute(1, 0, 2),
-            tc_time_pe,
-        ).permute(1, 0, 2)
-        tc_step_feat = self.tc_temporal_norm(tc_step_feat + tc_step_feat_temporal)
-
-        anchor_tc = gen_sineembed_for_position(ref_pos_target, hidden_dim=self.D, temperature=10000)
-        anchor_feat = self.anchor_enc['tc'](anchor_tc)
-
-        anchor_rel_feat = self.build_anchor_relation_feat(ref_pos_target, tc_dyn)
-        anchor_rel_feat = self.anchor_enc['rel'](anchor_rel_feat)
-        anchor_feat = anchor_feat + anchor_rel_feat
-
-        tc_d = self.tc_anchor_attn(
-            query=anchor_feat,
-            key=tc_step_feat,
-            value=tc_step_feat,
-        )[0]
-        tc_d = self.tc_anchor_norm(tc_d + anchor_feat)
-        tc_d = self.dynamics_enc['tc_q'](tc_d, anchor_feat) # (B, num_ba_query, D)
-        motion_feat = self.dynamics_enc['motion_fuse'](torch.cat([tc_d, anchor_feat], dim=-1))
-        output = output + motion_feat
-
         ref_pos_norm = ref_pos / self.denorm_scale[None, None, :]
-        motion_bias = self.motion_to_query_pos(motion_feat)
-        motion_gate = torch.sigmoid(self.motion_gate(torch.cat([anchor_feat, motion_feat], dim=-1)))
-        query_sine_embed = anchor_feat + motion_gate * motion_bias
-        # ==========================================================================
+        query_sine_embed = gen_sineembed_for_position(
+            ref_pos, hidden_dim=self.D, temperature=10000
+        )
+
+        # =========================== target motion ============================
+        # tc features previously built query semantics and described how each
+        # anchor relates to the current target motion. This path is disabled so
+        # BDA_DEC only aggregates BEV features at its anchor positions.
+        # tc_step_feat = self.dynamics_enc['tc'](tc_dyn)  # (B, t, D)
+        # tc_time_pe = self.build_history_time_pe(B, tc_step_feat.dtype, tc_step_feat.device)
+        # tc_step_feat_temporal = self.tc_temporal_mha(
+        #     tc_step_feat.permute(1, 0, 2),
+        #     tc_time_pe,
+        # ).permute(1, 0, 2)
+        # tc_step_feat = self.tc_temporal_norm(tc_step_feat + tc_step_feat_temporal)
+
+        # anchor_tc = gen_sineembed_for_position(ref_pos_target, hidden_dim=self.D, temperature=10000)
+        # anchor_feat = self.anchor_enc['tc'](anchor_tc)
+
+        # anchor_rel_feat = self.build_anchor_relation_feat(ref_pos_target, tc_dyn)
+        # anchor_rel_feat = self.anchor_enc['rel'](anchor_rel_feat)
+        # anchor_feat = anchor_feat + anchor_rel_feat
+
+        # tc_d = self.tc_anchor_attn(
+        #     query=anchor_feat,
+        #     key=tc_step_feat,
+        #     value=tc_step_feat,
+        # )[0]
+        # tc_d = self.tc_anchor_norm(tc_d + anchor_feat)
+        # tc_d = self.dynamics_enc['tc_q'](tc_d, anchor_feat) # (B, num_ba_query, D)
+        # motion_feat = self.dynamics_enc['motion_fuse'](torch.cat([tc_d, anchor_feat], dim=-1))
+        # output = output + motion_feat
+
+        # motion_bias = self.motion_to_query_pos(motion_feat)
+        # motion_gate = torch.sigmoid(self.motion_gate(torch.cat([anchor_feat, motion_feat], dim=-1)))
+        # query_sine_embed = anchor_feat + motion_gate * motion_bias
+        # ======================================================================
 
         for lid, layer in enumerate(self.bda_layers):
             output = layer(output, query_sine_embed, ref_pos_norm, bev_feat, lid)
