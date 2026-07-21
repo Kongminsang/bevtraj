@@ -169,6 +169,30 @@ class BEVTrajDecoder(nn.Module):
         self.goal_agent_distance_threshold = float(
             config.get('goal_agent_distance_threshold', 5.0)
         )
+        self.use_goal_flow_context = bool(
+            config.get('use_goal_flow_context', False)
+        )
+        self.goal_flow_distance_threshold = float(
+            config.get('goal_flow_distance_threshold', 10.0)
+        )
+        self.goal_flow_num_neighbors = int(
+            config.get('goal_flow_num_neighbors', 8)
+        )
+        self.goal_flow_hidden_dim = int(
+            config.get('goal_flow_hidden_dim', max(self.D // 4, 32))
+        )
+        self.goal_flow_anchor_chunk_size = int(
+            config.get('goal_flow_anchor_chunk_size', 64)
+        )
+        self.goal_heading_chord_steps = int(
+            config.get('goal_heading_chord_steps', 5)
+        )
+        if self.use_goal_flow_context and self.goal_flow_distance_threshold <= 0:
+            raise ValueError('goal_flow_distance_threshold must be positive')
+        if self.use_goal_flow_context and self.goal_flow_num_neighbors <= 0:
+            raise ValueError('goal_flow_num_neighbors must be positive')
+        if self.use_goal_flow_context and self.goal_flow_anchor_chunk_size <= 0:
+            raise ValueError('goal_flow_anchor_chunk_size must be positive')
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
@@ -207,9 +231,41 @@ class BEVTrajDecoder(nn.Module):
         self.goal_anchor_file_name = config['goal_anchor_file_name']
         file_path = MODEL_DIR / self.goal_anchor_file_name
         with open(file_path, 'rb') as f:
-            goal_anchor_indices = torch.tensor(
-                pickle.load(f)['VEHICLE']['anchor_indices']
-            ).long()
+            goal_anchor_data = pickle.load(f)['VEHICLE']
+        goal_anchor_indices = torch.as_tensor(
+            goal_anchor_data['anchor_indices'], dtype=torch.long
+        )
+        if goal_anchor_indices.ndim != 2 or goal_anchor_indices.size(0) != self.K:
+            raise ValueError(
+                'goal anchor clusters must have shape '
+                f'[{self.K}, anchors_per_mode], got '
+                f'{tuple(goal_anchor_indices.shape)}'
+            )
+        if (
+            goal_anchor_indices.numel() == 0
+            or goal_anchor_indices.min() < 0
+            or goal_anchor_indices.max() >= self.bda_sgcp.anchors.size(0)
+        ):
+            raise ValueError('goal anchor indices are outside the BDA anchor bank')
+
+        # The cluster file stores indices into the dense BDA anchor bank. Check
+        # that both artifacts still use exactly the same ordering before using
+        # an anchor-indexed arrival-heading buffer.
+        source_anchors = goal_anchor_data.get('source_anchors')
+        if source_anchors is not None:
+            source_anchors = torch.as_tensor(source_anchors, dtype=torch.float32)
+            if (
+                source_anchors.shape != self.bda_sgcp.anchors.shape
+                or not torch.allclose(
+                    source_anchors,
+                    self.bda_sgcp.anchors.detach().cpu(),
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+            ):
+                raise ValueError(
+                    'goal cluster source_anchors do not match the BDA anchor bank'
+                )
         goal_attn_mask = torch.ones(
             self.K, self.bda_sgcp.anchors.size(0), dtype=torch.bool
         )
@@ -222,6 +278,73 @@ class BEVTrajDecoder(nn.Module):
             goal_anchor_indices,
             persistent=False,
         )
+
+        if self.use_goal_flow_context:
+            # Estimate the target's arrival heading at every dense anchor once
+            # at construction time. A compact, stable trajectory set can be
+            # selected independently from initial_prediction's templates.
+            self.goal_heading_trajectory_file_name = config.get(
+                'goal_heading_trajectory_file_name',
+                config.get(
+                    'trajectory_file_name', 'trajectory_set_64_60.pkl'
+                ),
+            )
+            file_path = MODEL_DIR / self.goal_heading_trajectory_file_name
+            with open(file_path, 'rb') as f:
+                heading_trajectory_set = torch.from_numpy(
+                    pickle.load(f)['VEHICLE']
+                ).float()
+            (
+                goal_anchor_template_idx,
+                goal_anchor_heading,
+                goal_anchor_heading_sincos,
+            ) = self.precompute_goal_anchor_headings(
+                self.bda_sgcp.anchors.detach().cpu(),
+                heading_trajectory_set,
+                chord_steps=self.goal_heading_chord_steps,
+            )
+            self.register_buffer(
+                'goal_anchor_template_idx',
+                goal_anchor_template_idx,
+                persistent=False,
+            )
+            self.register_buffer(
+                'goal_anchor_heading',
+                goal_anchor_heading,
+                persistent=False,
+            )
+            self.register_buffer(
+                'goal_anchor_heading_sincos',
+                goal_anchor_heading_sincos,
+                persistent=False,
+            )
+
+            # Keep per-agent tokens in a small hidden space through top-k
+            # pooling; only the per-anchor aggregate is projected to D.
+            goal_flow_state_dim = 15
+            self.goal_flow_state_encoder = MLP(
+                goal_flow_state_dim,
+                self.goal_flow_hidden_dim,
+                self.goal_flow_hidden_dim,
+                3,
+            )
+            self.goal_flow_agent_score = MLP(
+                self.goal_flow_hidden_dim,
+                self.goal_flow_hidden_dim,
+                1,
+                2,
+            )
+            self.goal_flow_pool_proj = MLP(
+                self.goal_flow_hidden_dim * 3 + 1,
+                self.D,
+                self.D,
+                2,
+            )
+            self.goal_flow_norm = nn.LayerNorm(self.D)
+            self.goal_flow_fuse = MLP(self.D * 2, self.D, self.D, 2)
+            self.goal_flow_gate = nn.Linear(self.D * 2, 1)
+            nn.init.zeros_(self.goal_flow_gate.weight)
+            nn.init.constant_(self.goal_flow_gate.bias, -2.0)
 
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
@@ -345,6 +468,312 @@ class BEVTrajDecoder(nn.Module):
 
         return self.time_emb_alpha * pe
 
+    @staticmethod
+    def precompute_goal_anchor_headings(anchors, trajectories, chord_steps=5):
+        """Map each anchor to a nearby trajectory's robust terminal heading.
+
+        Args:
+            anchors: Dense goal anchors in the current target frame, [A, 2].
+            trajectories: Target-frame trajectory prototypes, [L, T, 2].
+            chord_steps: Number of terminal intervals used for the heading chord.
+
+        Returns:
+            Nearest template indices [A], angles [A], and (sin, cos) [A, 2].
+        """
+        anchors = torch.as_tensor(anchors, dtype=torch.float32)
+        trajectories = torch.as_tensor(trajectories, dtype=torch.float32)
+        if anchors.ndim != 2 or anchors.size(-1) != 2:
+            raise ValueError(f'anchors must have shape [A, 2], got {anchors.shape}')
+        if (
+            trajectories.ndim != 3
+            or trajectories.size(-1) != 2
+            or trajectories.size(0) == 0
+            or trajectories.size(1) == 0
+        ):
+            raise ValueError(
+                'trajectories must have non-empty shape [L, T, 2], got '
+                f'{trajectories.shape}'
+            )
+
+        num_steps = trajectories.size(1)
+        chord_steps = max(1, min(int(chord_steps), num_steps - 1)) \
+            if num_steps > 1 else 0
+        if chord_steps > 0:
+            terminal_vec = (
+                trajectories[:, -1] - trajectories[:, -1 - chord_steps]
+            )
+
+            # If a prototype is stationary over the terminal chord, use its
+            # most recent non-zero displacement instead of an arbitrary angle.
+            step_delta = trajectories[:, 1:] - trajectories[:, :-1]
+            moving = step_delta.square().sum(dim=-1) > 1e-8
+            step_indices = torch.arange(
+                step_delta.size(1), dtype=torch.long
+            ).view(1, -1)
+            last_moving_idx = torch.where(
+                moving,
+                step_indices,
+                step_indices.new_full(step_indices.shape, -1),
+            ).amax(dim=-1)
+            fallback_delta = step_delta[
+                torch.arange(step_delta.size(0)),
+                last_moving_idx.clamp_min(0),
+            ]
+            use_fallback = terminal_vec.square().sum(dim=-1) <= 1e-8
+            terminal_vec = torch.where(
+                use_fallback.unsqueeze(-1), fallback_delta, terminal_vec
+            )
+        else:
+            terminal_vec = trajectories[:, -1].clone()
+
+        # A fully stationary trajectory falls back to its endpoint direction;
+        # the degenerate origin case uses the target's forward (+x) direction.
+        stationary = terminal_vec.square().sum(dim=-1) <= 1e-8
+        terminal_vec = torch.where(
+            stationary.unsqueeze(-1), trajectories[:, -1], terminal_vec
+        )
+        stationary = terminal_vec.square().sum(dim=-1) <= 1e-8
+        forward = terminal_vec.new_tensor([1.0, 0.0]).expand_as(terminal_vec)
+        terminal_vec = torch.where(stationary.unsqueeze(-1), forward, terminal_vec)
+        terminal_direction = F.normalize(terminal_vec, dim=-1)
+
+        endpoint_distance_sq = (
+            anchors[:, None] - trajectories[None, :, -1]
+        ).square().sum(dim=-1)
+        template_idx = endpoint_distance_sq.argmin(dim=-1)
+        anchor_direction = terminal_direction[template_idx]
+        anchor_heading = torch.atan2(
+            anchor_direction[:, 1], anchor_direction[:, 0]
+        )
+        anchor_heading_sincos = torch.stack(
+            [anchor_direction[:, 1], anchor_direction[:, 0]], dim=-1
+        )
+        return template_idx, anchor_heading, anchor_heading_sincos
+
+    @staticmethod
+    def rotate_to_goal_frame(vectors, goal_heading_sincos):
+        """Rotate row-vector XY data by the negative goal heading."""
+        sin_heading = goal_heading_sincos[..., 0]
+        cos_heading = goal_heading_sincos[..., 1]
+        x_local = (
+            vectors[..., 0] * cos_heading
+            + vectors[..., 1] * sin_heading
+        )
+        y_local = (
+            -vectors[..., 0] * sin_heading
+            + vectors[..., 1] * cos_heading
+        )
+        return torch.stack([x_local, y_local], dim=-1)
+
+    def build_goal_anchor_flow_tokens(
+        self,
+        agent_history,
+        target_idx,
+        output_dtype,
+    ):
+        """Encode nearby agents in every anchor's arrival-pose frame.
+
+        Current position, heading, velocity, and acceleration directly describe
+        local traffic motion. Size/type retain agent semantics. The target is
+        excluded because its history is already encoded by BDA_DEC.
+        """
+        history_pos = agent_history['positions']
+        history_mask = agent_history['valid_mask'].bool()
+        current_pos = history_pos[:, :, -1].float()
+        current_valid = history_mask[:, :, -1]
+        B, num_agents, _ = current_pos.shape
+        num_anchors = self.bda_sgcp.anchors.size(0)
+
+        def current_feature(name, width, default=None):
+            feature = agent_history.get(name)
+            if feature is not None:
+                return feature[:, :, -1].float()
+            if default is not None:
+                return default
+            return current_pos.new_zeros(B, num_agents, width)
+
+        current_velocity = current_feature('velocity', 2)
+        current_acceleration = current_feature('acceleration', 2)
+        if history_mask.size(-1) > 1:
+            acceleration_valid = history_mask[:, :, -2:].all(dim=-1)
+            current_acceleration = current_acceleration * (
+                acceleration_valid.unsqueeze(-1).to(current_acceleration.dtype)
+            )
+        current_size = current_feature('size', 3)
+        current_type = current_feature('type', 3)
+
+        current_heading = agent_history.get('heading')
+        if current_heading is None:
+            speed = current_velocity.norm(dim=-1, keepdim=True)
+            direction = current_velocity / speed.clamp_min(1e-4)
+            default_direction = torch.cat(
+                [torch.zeros_like(speed), torch.ones_like(speed)], dim=-1
+            )
+            # Convert (cos, sin) velocity direction to dataset order (sin, cos).
+            current_heading = torch.stack(
+                [direction[..., 1], direction[..., 0]], dim=-1
+            )
+            current_heading = torch.where(
+                (speed > 1e-4).expand_as(current_heading),
+                current_heading,
+                default_direction,
+            )
+        else:
+            current_heading = current_heading[:, :, -1].float()
+
+        if num_agents == 0:
+            empty = current_pos.new_zeros(B, num_anchors, self.D)
+            return empty.to(dtype=output_dtype), empty[..., :1].bool()
+
+        target_idx = target_idx.to(device=current_pos.device, dtype=torch.long)
+        current_valid = current_valid.clone()
+        current_valid[
+            torch.arange(B, device=current_pos.device), target_idx
+        ] = False
+
+        num_neighbors = min(self.goal_flow_num_neighbors, num_agents)
+        radius_sq = self.goal_flow_distance_threshold ** 2
+        flow_chunks = []
+        presence_chunks = []
+
+        for anchor_start in range(0, num_anchors, self.goal_flow_anchor_chunk_size):
+            anchor_end = min(
+                anchor_start + self.goal_flow_anchor_chunk_size,
+                num_anchors,
+            )
+            anchor_pos = self.bda_sgcp.anchors[
+                anchor_start:anchor_end
+            ].float()
+            anchor_heading = self.goal_anchor_heading_sincos[
+                anchor_start:anchor_end
+            ].float()
+            chunk_size = anchor_pos.size(0)
+
+            delta_all = (
+                current_pos[:, None] - anchor_pos[None, :, None]
+            )
+            distance_sq = delta_all.square().sum(dim=-1)
+            pair_valid = (
+                current_valid[:, None]
+                & (distance_sq <= radius_sq)
+            )
+            masked_distance_sq = distance_sq.masked_fill(
+                ~pair_valid, float('inf')
+            )
+            nearest_distance_sq, nearest_idx = masked_distance_sq.topk(
+                num_neighbors, dim=-1, largest=False, sorted=True
+            )
+            nearest_valid = torch.isfinite(nearest_distance_sq)
+
+            def gather_agents(feature):
+                feature = feature[:, None].expand(
+                    -1, chunk_size, -1, -1
+                )
+                return torch.gather(
+                    feature,
+                    dim=2,
+                    index=nearest_idx.unsqueeze(-1).expand(
+                        -1, -1, -1, feature.size(-1)
+                    ),
+                )
+
+            neighbor_pos = gather_agents(current_pos)
+            neighbor_velocity = gather_agents(current_velocity)
+            neighbor_acceleration = gather_agents(current_acceleration)
+            neighbor_heading = gather_agents(current_heading)
+            neighbor_size = gather_agents(current_size)
+            neighbor_type = gather_agents(current_type)
+
+            pose_heading = anchor_heading[None, :, None]
+            local_pos = self.rotate_to_goal_frame(
+                neighbor_pos - anchor_pos[None, :, None], pose_heading
+            )
+            local_velocity = self.rotate_to_goal_frame(
+                neighbor_velocity, pose_heading
+            )
+            local_acceleration = self.rotate_to_goal_frame(
+                neighbor_acceleration, pose_heading
+            )
+
+            agent_sin = neighbor_heading[..., 0]
+            agent_cos = neighbor_heading[..., 1]
+            goal_sin = pose_heading[..., 0]
+            goal_cos = pose_heading[..., 1]
+            relative_heading = torch.stack(
+                [
+                    agent_sin * goal_cos - agent_cos * goal_sin,
+                    agent_cos * goal_cos + agent_sin * goal_sin,
+                ],
+                dim=-1,
+            )
+            neighbor_distance = nearest_distance_sq.clamp_min(0).sqrt()
+            normalized_distance = (
+                neighbor_distance / self.goal_flow_distance_threshold
+            ).unsqueeze(-1)
+
+            local_state = torch.cat(
+                [
+                    local_pos,
+                    local_velocity,
+                    local_acceleration,
+                    relative_heading,
+                    neighbor_size,
+                    neighbor_type,
+                    normalized_distance,
+                ],
+                dim=-1,
+            )
+            local_state = local_state.masked_fill(
+                ~nearest_valid.unsqueeze(-1), 0.0
+            ).to(dtype=output_dtype)
+            agent_token = self.goal_flow_state_encoder(local_state)
+
+            score = self.goal_flow_agent_score(agent_token).squeeze(-1)
+            score = score.float() - normalized_distance.squeeze(-1)
+            score = score.masked_fill(~nearest_valid, float('-inf'))
+            has_neighbor = nearest_valid.any(dim=-1, keepdim=True)
+            safe_score = torch.where(
+                has_neighbor, score, torch.zeros_like(score)
+            )
+            agent_weight = safe_score.softmax(dim=-1).to(agent_token.dtype)
+            agent_weight = agent_weight * nearest_valid.to(agent_token.dtype)
+            agent_weight = agent_weight / agent_weight.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-6)
+
+            attention_pool = (
+                agent_weight.unsqueeze(-1) * agent_token
+            ).sum(dim=-2)
+            valid_weight = nearest_valid.to(agent_token.dtype).unsqueeze(-1)
+            mean_pool = (agent_token * valid_weight).sum(dim=-2) / (
+                valid_weight.sum(dim=-2).clamp_min(1.0)
+            )
+            max_pool = agent_token.masked_fill(
+                ~nearest_valid.unsqueeze(-1),
+                torch.finfo(agent_token.dtype).min,
+            ).amax(dim=-2)
+            max_pool = torch.where(
+                has_neighbor, max_pool, torch.zeros_like(max_pool)
+            )
+            occupancy = (
+                nearest_valid.sum(dim=-1, keepdim=True).to(agent_token.dtype)
+                / float(num_neighbors)
+            )
+            flow_token = self.goal_flow_pool_proj(
+                torch.cat(
+                    [attention_pool, mean_pool, max_pool, occupancy], dim=-1
+                )
+            )
+            flow_token = self.goal_flow_norm(flow_token)
+            flow_token = flow_token * has_neighbor.to(flow_token.dtype)
+            flow_chunks.append(flow_token)
+            presence_chunks.append(has_neighbor)
+
+        return (
+            torch.cat(flow_chunks, dim=1),
+            torch.cat(presence_chunks, dim=1),
+        )
+
     def get_late_score_time_indices(self, device):
         stride = self.score_time_stride_late_layers
         if stride <= 1:
@@ -366,6 +795,31 @@ class BEVTrajDecoder(nn.Module):
         bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
         B = bda_token.size(0)
 
+        # Anchor-local traffic flow: each dense anchor uses the precomputed
+        # arrival heading as its local +x direction. Fusing before construction
+        # of key/value lets the cluster-restricted attention both score and
+        # retrieve this context without repeating work for overlapping modes.
+        if self.use_goal_flow_context:
+            goal_flow_token, goal_flow_present = (
+                self.build_goal_anchor_flow_tokens(
+                    agent_history,
+                    target_idx,
+                    output_dtype=bda_token.dtype,
+                )
+            )
+            flow_fuse_input = torch.cat(
+                [bda_token, goal_flow_token], dim=-1
+            )
+            goal_flow_delta = self.goal_flow_fuse(flow_fuse_input)
+            goal_flow_gate = torch.sigmoid(
+                self.goal_flow_gate(flow_fuse_input)
+            )
+            bda_token = bda_token + (
+                goal_flow_present.to(bda_token.dtype)
+                * goal_flow_gate
+                * goal_flow_delta
+            )
+
         bda_pos_embed = gen_sineembed_for_position(
             bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
         )
@@ -376,7 +830,10 @@ class BEVTrajDecoder(nn.Module):
         agent_history_pos = agent_history['positions']
         agent_history_mask = agent_history['valid_mask'].bool()
         num_agents = scene_context.size(0)
-        batch_idx = torch.arange(B, device=target_idx.device)
+        target_idx = target_idx.to(
+            device=agent_history_pos.device, dtype=torch.long
+        )
+        batch_idx = torch.arange(B, device=agent_history_pos.device)
 
         # An agent belongs to a mode when any of its valid past positions is
         # close to any anchor in that mode. Process one mode at a time to avoid
@@ -400,7 +857,7 @@ class BEVTrajDecoder(nn.Module):
         # The target agent is useful for every proposal mode regardless of its
         # distance to the cluster. Padding remains controlled independently by
         # scene_key_padding_mask below.
-        agents_in_mode[batch_idx, :, target_idx.long()] = True
+        agents_in_mode[batch_idx, :, target_idx] = True
         goal_scene_attn_mask = ~agents_in_mode
         goal_scene_attn_mask = goal_scene_attn_mask[:, None].expand(
             -1, self.num_heads, -1, -1
@@ -442,9 +899,8 @@ class BEVTrajDecoder(nn.Module):
             mode_query = layer['norm3'](layer['ffn'](mode_query))
 
         # =================== Goal aggregation and output heads =================
-        # Select exactly one anchor in the forward pass while keeping the soft
-        # attention path as a straight-through gradient surrogate. Compute the
-        # attention distribution in fp32 for AMP stability.
+        # Sharpen the differentiable attention distribution for a goal position
+        # closer to the highest-scoring anchor. Compute in fp32 for AMP stability.
         tempered_log_attn = (
             final_cross_attn.float().clamp_min(1e-12).log()
             / self.goal_attn_temperature
@@ -453,23 +909,9 @@ class BEVTrajDecoder(nn.Module):
             self.goal_attn_mask[None], float('-inf')
         )
         normalized_attn = tempered_log_attn.softmax(dim=-1)
-
-        hard_anchor_idx = tempered_log_attn.argmax(dim=-1)  # [B, K]
-        hard_goal_position = bda_pos.gather(
-            dim=1,
-            index=hard_anchor_idx.unsqueeze(-1).expand(
-                -1, -1, bda_pos.size(-1)
-            ),
-        )  # [B, K, 2]
-        soft_goal_position = (
-            bda_pos[:, None] * normalized_attn.unsqueeze(-1)
-        ).sum(dim=2)  # [B, K, 2]
-
-        # Forward value is hard_goal_position; backward follows soft_goal_position.
         goal_position = (
-            hard_goal_position
-            + (soft_goal_position - soft_goal_position.detach())
-        ).permute(1, 0, 2).contiguous()
+            bda_pos[:, None] * normalized_attn.unsqueeze(-1)
+        ).sum(dim=2).permute(1, 0, 2).contiguous()
 
         goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
         return mode_query, goal_position, goal_FDE

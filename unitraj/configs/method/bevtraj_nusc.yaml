@@ -210,6 +210,13 @@ MODEL:
         num_goal_proposal_layers: 2
         goal_attn_temperature: 0.25
         goal_agent_distance_threshold: 5.0  # meters in target-centric coordinates
+        use_goal_flow_context: true
+        goal_flow_distance_threshold: 10.0  # current agents around each goal pose
+        goal_flow_num_neighbors: 8
+        goal_flow_hidden_dim: 64
+        goal_flow_anchor_chunk_size: 64
+        goal_heading_trajectory_file_name: 'trajectory_set_64_60.pkl'
+        goal_heading_chord_steps: 5  # terminal 0.5 s at dt=0.1
         num_decoder_layers: 6
         num_heads: 16
         score_time_stride_late_layers: 4
