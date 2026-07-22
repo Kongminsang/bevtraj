@@ -186,15 +186,9 @@ class Criterion(nn.Module):
         w_cls = self.config.get('cls_weight', 2.0)
         w_reg = self.config.get('reg_weight', 1.0)
         w_vel = self.config.get('vel_weight', 0.2)
-        w_cls_final = self.config.get('cls_weight_final', 2.0)
-        w_reg_final = self.config.get('reg_weight_final', 1.0)
-        w_vel_final = self.config.get('vel_weight_final', w_vel)
         w_acc = float(self.config.get('acc_weight', 0.0))
         w_jerk = float(self.config.get('jerk_weight', 0.0))
         w_curvature = float(self.config.get('curvature_weight', 0.0))
-        w_acc_final = float(self.config.get('acc_weight_final', w_acc))
-        w_jerk_final = float(self.config.get('jerk_weight_final', w_jerk))
-        w_curvature_final = float(self.config.get('curvature_weight_final', w_curvature))
 
         # EDA-related config
         num_inter_layers = int(self.config.get('num_inter_layers', 2))
@@ -205,14 +199,6 @@ class Criterion(nn.Module):
         num_layers = len(preds)
 
         for layer_idx, (pred_scores, pred, pred_vel) in enumerate(zip(modes_preds, preds, pred_vels)):
-            is_last_layer = (layer_idx == num_layers - 1)
-            cur_w_cls = w_cls_final if is_last_layer else w_cls
-            cur_w_reg = w_reg_final if is_last_layer else w_reg
-            cur_w_vel = w_vel_final if is_last_layer else w_vel
-            cur_w_acc = w_acc_final if is_last_layer else w_acc
-            cur_w_jerk = w_jerk_final if is_last_layer else w_jerk
-            cur_w_curvature = w_curvature_final if is_last_layer else w_curvature
-
             # pred: [K, T, B, 5] -> [B, K, T, 5]
             pred_trajs = pred.permute(2, 0, 1, 3).contiguous()
             pred_vel = pred_vel.permute(2, 0, 1, 3).contiguous()   # [B, K, T, 2]
@@ -330,11 +316,11 @@ class Criterion(nn.Module):
             loss_cls = F.binary_cross_entropy_with_logits(pred_scores, bce_target, reduction='none')  # [B, K]
             loss_cls = (loss_cls * select_mask.float()).sum(dim=-1)                                    # [B]
 
-            layer_loss = cur_w_reg * (
+            layer_loss = w_reg * (
                 loss_reg_gmm + self.initial_reg_aux_weight * loss_reg_aux
-            ) + cur_w_vel * loss_reg_vel + cur_w_cls * loss_cls
+            ) + w_vel * loss_reg_vel + w_cls * loss_cls
             layer_loss = (layer_loss * valid_final).sum() / valid_final.sum().clamp_min(1.0)
-            layer_loss = layer_loss + cur_w_acc * loss_acc + cur_w_jerk * loss_jerk + cur_w_curvature * loss_curvature
+            layer_loss = layer_loss + w_acc * loss_acc + w_jerk * loss_jerk + w_curvature * loss_curvature
             total = total + layer_loss
 
         return total / num_layers

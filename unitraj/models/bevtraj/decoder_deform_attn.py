@@ -101,6 +101,15 @@ class BEVDeformCrossAttn(nn.Module):
         if self.multi_range:
             group_scales = torch.tensor(offset_group_scales, dtype=torch.float32)
             points_per_group = self.num_sampling_points // group_scales.numel()
+            group_min_scales = torch.cat([
+                group_scales.new_zeros(1),
+                group_scales[:-1],
+            ])
+            self.register_buffer(
+                'offset_point_min_scales',
+                group_min_scales.repeat_interleave(points_per_group),
+                persistent=False,
+            )
             self.register_buffer(
                 'offset_point_scales',
                 group_scales.repeat_interleave(points_per_group),
@@ -108,6 +117,32 @@ class BEVDeformCrossAttn(nn.Module):
             )
 
         self.to_out = nn.Linear(self.kv_dim, dim)
+
+    def apply_multi_range(self, raw_offsets):
+        """Constrain each sampling-point offset to its time-scaled annulus."""
+        angle = raw_offsets[..., 0]
+        radial_fraction = torch.sigmoid(raw_offsets[..., 1:2])
+        direction = torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
+
+        # The point-wise lower/upper bounds form [0, s_0], [s_0, s_1], ...
+        # annuli. Angle and radius are independent, smooth learned variables.
+        point_min = self.offset_point_min_scales[
+            None, None, None, None, :, None
+        ].type_as(raw_offsets)
+        point_max = self.offset_point_scales[
+            None, None, None, None, :, None
+        ].type_as(raw_offsets)
+        radius = point_min + radial_fraction * (point_max - point_min)
+
+        time_scales = torch.linspace(
+            self.time_scale_range[0],
+            self.time_scale_range[1],
+            raw_offsets.shape[2],
+            device=raw_offsets.device,
+            dtype=raw_offsets.dtype,
+        )
+        radius = radius * time_scales[None, None, :, None, None, None]
+        return direction * radius
     
     def forward(self, dec_embed, bev_feat, query_scale, ref_points, identity=None, return_vgrid=False):
         """
@@ -142,17 +177,7 @@ class BEVDeformCrossAttn(nn.Module):
             B, K, T, num_heads, num_points, 2
         )
         if self.multi_range:
-            time_scales = torch.linspace(
-                self.time_scale_range[0],
-                self.time_scale_range[1],
-                T,
-                device=offsets.device,
-                dtype=offsets.dtype,
-            )
-            offsets = offsets * time_scales[None, None, :, None, None, None]
-            offsets = offsets * self.offset_point_scales[
-                None, None, None, None, :, None
-            ].type_as(offsets)
+            offsets = self.apply_multi_range(offsets)
 
         ref_pos_norm = (
             ref_points[:, :, :, None, None, :]
