@@ -260,8 +260,11 @@ MODEL:
             grid_size: *grid_size
 
     loss:
-        # SGCP loss
-        goal_position_weight: 3.0
+        # SGCP anchor-distribution loss
+        entropy_weight: 0.3
+        kl_weight: 1.0
+        goal_prob_sigma: 2.0
+        # Existing per-component FDE quality auxiliary
         disp_weight: 1.0
         # decoder loss
         cls_weight: 1.0

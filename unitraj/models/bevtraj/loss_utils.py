@@ -62,6 +62,8 @@ class Criterion(nn.Module):
 
         anchor_pos = out['anchor_pos']
         goal_position = out['predicted_goal_position']
+        goal_probability = out['predicted_goal_probability']
+        goal_anchor_position = out['goal_anchor_position']
         goal_FDE = out['predicted_goal_FDE']
 
         dense_future_pred = out['dense_future_pred']
@@ -70,19 +72,35 @@ class Criterion(nn.Module):
 
         gt_decoder = gt[0]
         gt_dense_future_trajs = gt[1]
+
+        weighted_goal_position, positive_goal_component = \
+            self.get_positive_goal_component(
+                goal_probability=goal_probability,
+                goal_anchor_position=goal_anchor_position,
+                gt=gt_decoder,
+                center_gt_final_valid_idx=center_gt_final_valid_idx,
+            )
         
         decoder_loss = self.get_decoder_loss_hard_assign(
             modes_preds=modes_preds,
             preds=preds,
             pred_vels=pred_vels,
             anchor_pos=anchor_pos,
-            goal_anchor_pos=goal_position.permute(1, 0, 2).contiguous(),
+            goal_anchor_pos=weighted_goal_position,
             gt_decoder=gt_decoder,
             center_gt_final_valid_idx=center_gt_final_valid_idx,
             current_epoch=current_epoch,
         )
 
-        goal_prediction_loss = self.get_goal_prediction_loss(
+        goal_prob_loss = self.get_goal_prob_loss(
+            goal_probability=goal_probability,
+            goal_anchor_position=goal_anchor_position,
+            positive_goal_component=positive_goal_component,
+            gt=gt_decoder,
+            center_gt_final_valid_idx=center_gt_final_valid_idx,
+        )
+
+        goal_fde_loss = self.get_goal_fde_loss(
             goal_position=goal_position,
             goal_FDE=goal_FDE,
             gt=gt_decoder,
@@ -96,7 +114,13 @@ class Criterion(nn.Module):
 
         dense_future_loss = self.get_dense_future_prediction_loss(dense_future_pred, gt_dense_future_trajs)
 
-        total_loss = decoder_loss + goal_prediction_loss + state_query_loss + dense_future_loss
+        total_loss = (
+            decoder_loss
+            + goal_prob_loss
+            + goal_fde_loss
+            + state_query_loss
+            + dense_future_loss
+        )
         return total_loss
 
     @staticmethod
@@ -315,9 +339,114 @@ class Criterion(nn.Module):
 
         return total / num_layers
     
-    def get_goal_prediction_loss(self, goal_position, goal_FDE, gt, center_gt_final_valid_idx):
+    @staticmethod
+    def get_positive_goal_component(
+        goal_probability,
+        goal_anchor_position,
+        gt,
+        center_gt_final_valid_idx,
+    ):
+        """Hard-assign each sample to the closest weighted goal component."""
+        B, K, A = goal_probability.shape
+        assert goal_anchor_position.shape == (B, K, A, 2)
+
+        b_idx = torch.arange(B, device=goal_probability.device)
+        final_idx = center_gt_final_valid_idx.long()
+        gt_goal = gt[b_idx, final_idx, :2]
+
+        with torch.no_grad():
+            weighted_goal_position = (
+                goal_probability.detach().unsqueeze(-1)
+                * goal_anchor_position.detach()
+            ).sum(dim=2)
+            goal_distance = (
+                weighted_goal_position - gt_goal[:, None]
+            ).square().sum(dim=-1)
+            positive_goal_component = goal_distance.argmin(dim=-1)
+
+        return weighted_goal_position, positive_goal_component
+
+    def get_goal_prob_loss(
+        self,
+        goal_probability,
+        goal_anchor_position,
+        positive_goal_component,
+        gt,
+        center_gt_final_valid_idx,
+    ):
+        """Train only the hard-assigned mode's distribution over its anchors."""
+        eps = 1e-9
+        entropy_weight = float(self.config.get('entropy_weight', 0.3))
+        kl_weight = float(self.config.get('kl_weight', 1.0))
+        sigma = float(self.config.get('goal_prob_sigma', 2.0))
+        if sigma <= 0:
+            raise ValueError('goal_prob_sigma must be positive')
+
+        B, K, A = goal_probability.shape
+        assert goal_anchor_position.shape == (B, K, A, 2)
+        assert positive_goal_component.shape == (B,)
+
+        device = goal_probability.device
+        b_idx = torch.arange(B, device=device)
+        final_idx = center_gt_final_valid_idx.long()
+        gt_goal = gt[b_idx, final_idx, :2]
+        valid_final = gt[b_idx, final_idx, -1].float()
+        valid_count = valid_final.sum().clamp_min(1.0)
+
+        # Only the selected goal component receives distribution supervision.
+        goal_probability = goal_probability[b_idx, positive_goal_component]
+        goal_anchor_position = goal_anchor_position[
+            b_idx, positive_goal_component
+        ]
+
+        # Isotropic Gaussian likelihood p(goal_gt | anchor), with its constant
+        # omitted because it cancels during posterior normalization.
+        sq_dist = (
+            goal_anchor_position - gt_goal[:, None]
+        ).square().sum(dim=-1)
+        log_likelihood = -0.5 * sq_dist / (sigma ** 2)
+
+        # q(anchor) is the GT-conditioned posterior formed from the predicted
+        # prior and the spatial likelihood.
+        prior = goal_probability.clamp_min(eps)
+        prior = prior / prior.sum(dim=-1, keepdim=True)
+        log_prior = prior.log()
+        log_posterior = log_likelihood + log_prior
+        log_posterior = log_posterior - torch.logsumexp(
+            log_posterior, dim=-1, keepdim=True
+        )
+        posterior = log_posterior.exp()
+
+        nll_per_sample = ((-log_likelihood) * posterior).sum(dim=-1)
+        nll = (nll_per_sample * valid_final).sum() / valid_count
+
+        entropy_per_sample = -(
+            posterior * log_posterior
+        ).sum(dim=-1)
+        posterior_entropy = (
+            entropy_per_sample * valid_final
+        ).sum() / valid_count
+
+        kl_per_sample = (
+            posterior * (log_posterior - log_prior)
+        ).sum(dim=-1)
+        kl_loss = (kl_per_sample * valid_final).sum() / valid_count
+
+        return (
+            nll
+            + entropy_weight * posterior_entropy
+            + kl_weight * kl_loss
+        )
+
+    def get_goal_fde_loss(
+        self,
+        goal_position,
+        goal_FDE,
+        gt,
+        center_gt_final_valid_idx,
+    ):
         """
-        goal_position: [K, B, 2]
+        goal_position: [K, B, 2], discrete argmax anchor coordinates
         goal_FDE: [B, K]
         gt: [B, T, 5]  # (x, y, vx, vy, valid)
         center_gt_final_valid_idx: [B]
@@ -330,17 +459,9 @@ class Criterion(nn.Module):
         gt_goal = gt[b_idx, final_idx, :2]            # [B, 2]
         valid_final = gt[b_idx, final_idx, -1].float() # [B]
 
-        goal_position_bk2 = goal_position.permute(1, 0, 2)
-        dist = torch.norm(goal_position_bk2 - gt_goal.unsqueeze(1), p=2, dim=-1)
-        position_loss_per_sample = dist.min(dim=1)[0]
-        position_loss = (
-            (position_loss_per_sample * valid_final).sum()
-            / valid_final.sum().clamp_min(1.0)
-        )
-
         # FDE is a detached quality target: it trains the ranking head without
         # leaking gradients into the proposed goal coordinates.
-        final_goal_position = goal_position_bk2.detach()
+        final_goal_position = goal_position.permute(1, 0, 2).detach()
         FDE_gt = torch.norm(
             final_goal_position - gt_goal.unsqueeze(1), p=2, dim=-1
         )
@@ -352,12 +473,7 @@ class Criterion(nn.Module):
         else:
             disp_loss = goal_FDE.sum() * 0.0
 
-        return (
-            self.config.get(
-                'goal_position_weight', self.config.get('goal_reg_weight', 1.0)
-            ) * position_loss
-            + self.config.get('disp_weight', 1.0) * disp_loss
-        )
+        return self.config.get('disp_weight', 1.0) * disp_loss
     
     def get_state_query_loss(self, state_pred, gt):
         """

@@ -167,7 +167,11 @@ class BEVTrajDecoder(nn.Module):
         self.L_goal_proposal = config['num_goal_proposal_layers']
         if self.L_goal_proposal <= 0:
             raise ValueError('num_goal_proposal_layers must be positive')
-        self.goal_attn_temperature = config.get('goal_attn_temperature', 0.25)
+        self.goal_attn_temperature = float(
+            config.get('goal_attn_temperature', 0.25)
+        )
+        if self.goal_attn_temperature <= 0:
+            raise ValueError('goal_attn_temperature must be positive')
         self.use_goal_flow_context = bool(
             config.get('use_goal_flow_context', False)
         )
@@ -854,19 +858,23 @@ class BEVTrajDecoder(nn.Module):
                     attn_mask=self.goal_attn_mask,
                     need_weights=is_last_layer,
                 )
-                flow_mode_query = layer['flow_cross_norm'](
-                    flow_mode_query + flow_cross_out
-                )
-                flow_self_out = layer['flow_self_attn'](
-                    flow_mode_query, flow_mode_query, flow_mode_query,
-                    need_weights=False,
-                )[0]
-                flow_mode_query = layer['flow_self_norm'](
-                    flow_mode_query + flow_self_out
-                )
-                flow_mode_query = layer['flow_ffn_norm'](
-                    layer['flow_ffn'](flow_mode_query)
-                )
+                # The last flow representation is not consumed downstream;
+                # only its cross-attention distribution is used. Refine the
+                # query only when another proposal layer will consume it.
+                if not is_last_layer:
+                    flow_mode_query = layer['flow_cross_norm'](
+                        flow_mode_query + flow_cross_out
+                    )
+                    flow_self_out = layer['flow_self_attn'](
+                        flow_mode_query, flow_mode_query, flow_mode_query,
+                        need_weights=False,
+                    )[0]
+                    flow_mode_query = layer['flow_self_norm'](
+                        flow_mode_query + flow_self_out
+                    )
+                    flow_mode_query = layer['flow_ffn_norm'](
+                        layer['flow_ffn'](flow_mode_query)
+                    )
 
         # =================== Goal aggregation and output heads =================
         # Multiplication in probability space becomes addition in log space.
@@ -881,16 +889,36 @@ class BEVTrajDecoder(nn.Module):
         tempered_log_attn = tempered_log_attn.masked_fill(
             self.goal_attn_mask[None], float('-inf')
         )
-        normalized_attn = tempered_log_attn.softmax(dim=-1)
-        goal_position = (
-            bda_pos[:, None] * normalized_attn.unsqueeze(-1)
-        ).sum(dim=2).permute(1, 0, 2).contiguous()
+        dense_goal_probability = tempered_log_attn.softmax(dim=-1)
+
+        # Expose a compact distribution over each mode's own cluster. The
+        # cluster width is data-driven (for example 64 or 128 anchors).
+        cluster_indices = self.goal_anchor_indices[None].expand(B, -1, -1)
+        goal_probability = dense_goal_probability.gather(
+            dim=-1, index=cluster_indices
+        )
+        goal_anchor_position = bda_pos[:, self.goal_anchor_indices]
+
+        # Goal coordinates used by trajectory decoding are discrete anchor
+        # predictions. The attention-guided weighted position is computed only
+        # in the loss for hard positive-component assignment.
+        local_goal_idx = goal_probability.argmax(dim=-1)
+        goal_position = goal_anchor_position.gather(
+            dim=2,
+            index=local_goal_idx[:, :, None, None].expand(-1, -1, 1, 2),
+        ).squeeze(2).permute(1, 0, 2).contiguous()
 
         # Keep the downstream proposal representation BDA-centric. Traffic flow
         # affects anchor selection through the joint score without being mixed
         # back into the BDA query representation.
         goal_FDE = self.goal_FDE(bda_mode_query).squeeze(-1).T
-        return bda_mode_query, goal_position, goal_FDE
+        return (
+            bda_mode_query,
+            goal_position,
+            goal_probability,
+            goal_anchor_position,
+            goal_FDE,
+        )
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
@@ -1217,7 +1245,13 @@ class BEVTrajDecoder(nn.Module):
         scene_context = scene_context.permute(1, 0, 2)
 
         # -------------------Goal Candidate Proposal -----------------
-        mode_query, goal_position, goal_FDE = \
+        (
+            mode_query,
+            goal_position,
+            goal_probability,
+            goal_anchor_position,
+            goal_FDE,
+        ) = \
             self.goal_candidate_proposal(
                 bev_feat,
                 ec_dyn,
@@ -1313,6 +1347,8 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_velocity': pred_vels,
                   'anchor_pos' : anchor_pos,
                   'predicted_goal_position': goal_position,
+                  'predicted_goal_probability': goal_probability,
+                  'goal_anchor_position': goal_anchor_position,
                   'predicted_goal_FDE': goal_FDE,
                 #   'init_top_idx': init_top_idx,                # [B, K]
                   'state_pred': state_pred, # [B, T, 2]
