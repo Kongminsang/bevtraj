@@ -24,6 +24,15 @@ class Criterion(nn.Module):
         self.goal_prob_progress_sigma = float(
             self.config.get('goal_prob_progress_sigma', 8.0)
         )
+        self.goal_prob_match_cost_margin = float(
+            self.config.get('goal_prob_match_cost_margin', 0.1)
+        )
+        self.goal_prob_match_temperature = float(
+            self.config.get('goal_prob_match_temperature', 0.1)
+        )
+        self.goal_prob_max_extra_modes = int(
+            self.config.get('goal_prob_max_extra_modes', 2)
+        )
 
     def get_trajectory_smoothness_loss(self, pred_xy, valid_mask):
         valid_mask = valid_mask.to(pred_xy.dtype)
@@ -419,7 +428,13 @@ class Criterion(nn.Module):
         gt,
         center_gt_final_valid_idx,
     ):
-        """Train only the hard-assigned mode's distribution over its anchors."""
+        """
+        Train the best goal mode and up to a few near-optimal modes.
+
+        Matching is detached and uses the same weighted-goal path cost as the
+        hard assignment. Only modes within a small relative cost margin are
+        added, and their losses are down-weighted according to the cost gap.
+        """
         eps = 1e-9
         entropy_weight = float(self.config.get('entropy_weight', 0.3))
         kl_weight = float(self.config.get('kl_weight', 1.0))
@@ -434,11 +449,80 @@ class Criterion(nn.Module):
         valid_final = gt[b_idx, final_idx, -1].float()
         valid_count = valid_final.sum().clamp_min(1.0)
 
-        # Only the selected goal component receives distribution supervision.
-        goal_probability = goal_probability[b_idx, positive_goal_component]
-        goal_anchor_position = goal_anchor_position[
-            b_idx, positive_goal_component
-        ]
+        # Keep the hard positive and add at most N other modes whose detached
+        # weighted goals are nearly tied with it under the same path cost.
+        with torch.no_grad():
+            weighted_goal_position = (
+                goal_probability.detach().unsqueeze(-1)
+                * goal_anchor_position.detach()
+            ).sum(dim=2)
+            matching_cost = self._get_goal_path_cost(
+                goal_position=weighted_goal_position,
+                gt=gt,
+                center_gt_final_valid_idx=center_gt_final_valid_idx,
+                lateral_sigma=self.goal_prob_lateral_sigma,
+                progress_sigma=self.goal_prob_progress_sigma,
+            )
+            best_cost = matching_cost.gather(
+                1, positive_goal_component[:, None]
+            )
+            cost_gap = matching_cost - best_cost
+
+            extra_candidate = (
+                cost_gap <= self.goal_prob_match_cost_margin
+            )
+            extra_candidate.scatter_(
+                1, positive_goal_component[:, None], False
+            )
+
+            num_extra = min(self.goal_prob_max_extra_modes, max(K - 1, 0))
+            if num_extra > 0:
+                extra_cost = matching_cost.masked_fill(
+                    ~extra_candidate, float('inf')
+                )
+                extra_cost, extra_idx = extra_cost.topk(
+                    k=num_extra, dim=-1, largest=False, sorted=True
+                )
+                extra_valid = torch.isfinite(extra_cost)
+                selected_component = torch.cat(
+                    [positive_goal_component[:, None], extra_idx], dim=-1
+                )
+                selected_valid = torch.cat(
+                    [
+                        torch.ones(
+                            B, 1, device=device, dtype=torch.bool
+                        ),
+                        extra_valid,
+                    ],
+                    dim=-1,
+                )
+            else:
+                selected_component = positive_goal_component[:, None]
+                selected_valid = torch.ones(
+                    B, 1, device=device, dtype=torch.bool
+                )
+
+            selected_cost_gap = cost_gap.gather(
+                1, selected_component
+            ).clamp_min(0.0)
+            mode_log_weight = (
+                -selected_cost_gap / self.goal_prob_match_temperature
+            )
+            mode_log_weight = mode_log_weight.masked_fill(
+                ~selected_valid, float('-inf')
+            )
+            mode_weight = mode_log_weight.softmax(dim=-1)
+
+        goal_probability = goal_probability.gather(
+            1,
+            selected_component[:, :, None].expand(-1, -1, A),
+        )
+        goal_anchor_position = goal_anchor_position.gather(
+            1,
+            selected_component[:, :, None, None].expand(
+                -1, -1, A, goal_anchor_position.size(-1)
+            ),
+        )
 
         # Anisotropic path-tube likelihood: deviations across the GT path are
         # penalized more strongly than along-path progress (speed) errors.
@@ -462,19 +546,24 @@ class Criterion(nn.Module):
         )
         posterior = log_posterior.exp()
 
-        nll_per_sample = ((-log_likelihood) * posterior).sum(dim=-1)
+        nll_per_mode = ((-log_likelihood) * posterior).sum(dim=-1)
+        nll_per_sample = (nll_per_mode * mode_weight).sum(dim=-1)
         nll = (nll_per_sample * valid_final).sum() / valid_count
 
-        entropy_per_sample = -(
+        entropy_per_mode = -(
             posterior * log_posterior
+        ).sum(dim=-1)
+        entropy_per_sample = (
+            entropy_per_mode * mode_weight
         ).sum(dim=-1)
         posterior_entropy = (
             entropy_per_sample * valid_final
         ).sum() / valid_count
 
-        kl_per_sample = (
+        kl_per_mode = (
             posterior * (log_posterior - log_prior)
         ).sum(dim=-1)
+        kl_per_sample = (kl_per_mode * mode_weight).sum(dim=-1)
         kl_loss = (kl_per_sample * valid_final).sum() / valid_count
 
         return (
