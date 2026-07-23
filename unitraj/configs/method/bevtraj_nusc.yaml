@@ -278,9 +278,7 @@ MODEL:
         dense_future_weight: 0.5
         # EDA
         num_inter_layers: 2
-        initial_branch_warmup_epochs: 7
-        initial_reg_aux_weight: 0.2
-        distinct_anchors: false
+        distinct_anchors: true
         distinct_nms_thresh: -1.0
 
     optimizer:

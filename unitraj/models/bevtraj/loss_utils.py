@@ -13,12 +13,6 @@ class Criterion(nn.Module):
         self.goal_FDE_loss = nn.SmoothL1Loss(reduction='mean', beta=1.0)
         self.smoothness_dt = float(self.config.get('smoothness_dt', 0.1))
         self.curvature_min_speed = float(self.config.get('curvature_min_speed', 0.5))
-        self.initial_branch_warmup_epochs = int(
-            self.config.get('initial_branch_warmup_epochs', 7)
-        )
-        self.initial_reg_aux_weight = float(
-            self.config.get('initial_reg_aux_weight', 0.2)
-        )
         self.inv_smoothness_dt2 = 1.0 / (self.smoothness_dt ** 2)
         self.inv_smoothness_dt3 = 1.0 / (self.smoothness_dt ** 3)
 
@@ -55,13 +49,12 @@ class Criterion(nn.Module):
 
         return loss_acc, loss_jerk, loss_curvature
 
-    def forward(self, out, gt, center_gt_final_valid_idx, traj_data, current_epoch=0):
+    def forward(self, out, gt, center_gt_final_valid_idx, traj_data):
         modes_preds = out['predicted_probability'] # [B, K]
         preds = out['predicted_trajectory'] # [K, T, B, 5]
         pred_vels = out['predicted_velocity'] # [K, T, B, 2]
 
-        anchor_pos = out['anchor_pos']
-        goal_position = out['predicted_goal_position']
+        predicted_goal_position = out['predicted_goal_position']
         goal_probability = out['predicted_goal_probability']
         goal_anchor_position = out['goal_anchor_position']
         goal_FDE = out['predicted_goal_FDE']
@@ -73,7 +66,7 @@ class Criterion(nn.Module):
         gt_decoder = gt[0]
         gt_dense_future_trajs = gt[1]
 
-        weighted_goal_position, positive_goal_component = \
+        positive_goal_component = \
             self.get_positive_goal_component(
                 goal_probability=goal_probability,
                 goal_anchor_position=goal_anchor_position,
@@ -85,11 +78,9 @@ class Criterion(nn.Module):
             modes_preds=modes_preds,
             preds=preds,
             pred_vels=pred_vels,
-            anchor_pos=anchor_pos,
-            goal_anchor_pos=weighted_goal_position,
+            predicted_goal_position=predicted_goal_position,
             gt_decoder=gt_decoder,
             center_gt_final_valid_idx=center_gt_final_valid_idx,
-            current_epoch=current_epoch,
         )
 
         goal_prob_loss = self.get_goal_prob_loss(
@@ -101,7 +92,7 @@ class Criterion(nn.Module):
         )
 
         goal_fde_loss = self.get_goal_fde_loss(
-            goal_position=goal_position,
+            predicted_goal_position=predicted_goal_position,
             goal_FDE=goal_FDE,
             gt=gt_decoder,
             center_gt_final_valid_idx=center_gt_final_valid_idx,
@@ -123,54 +114,14 @@ class Criterion(nn.Module):
         )
         return total_loss
 
-    @staticmethod
-    def get_initial_pair_assignment(
-        pred_trajs,
-        goal_anchor_pos,
-        gt_xy,
-        gt_mask,
-        gt_goal,
-        select_mask,
-    ):
-        """Match a goal mode first, then its regressed/predefined pair."""
-        B, num_candidates, _, _ = pred_trajs.shape
-        num_goal_modes = goal_anchor_pos.size(1)
-        assert num_candidates == num_goal_modes * 2
-        assert select_mask.shape == (B, num_candidates)
-
-        pair_select_mask = select_mask.reshape(B, num_goal_modes, 2)
-        mode_select_mask = pair_select_mask.any(dim=-1)
-        assert mode_select_mask.any(dim=-1).all()
-
-        goal_dist = (goal_anchor_pos - gt_goal[:, None, :]).norm(dim=-1)
-        goal_dist = goal_dist.masked_fill(~mode_select_mask, 1e10)
-        goal_mode_idx = goal_dist.argmin(dim=-1)
-
-        branch_offsets = torch.arange(2, device=pred_trajs.device)
-        pair_indices = goal_mode_idx[:, None] * 2 + branch_offsets[None, :]
-        b_idx = torch.arange(B, device=pred_trajs.device)
-        pair_trajs = pred_trajs[b_idx[:, None], pair_indices, :, :2]
-
-        branch_dist = (pair_trajs - gt_xy[:, None, :, :]).norm(dim=-1)
-        branch_dist = (branch_dist * gt_mask[:, None, :]).sum(dim=-1)
-        branch_dist = branch_dist / gt_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-
-        pair_is_selected = pair_select_mask[b_idx, goal_mode_idx]
-        branch_dist = branch_dist.masked_fill(~pair_is_selected, 1e10)
-        branch_idx = branch_dist.argmin(dim=-1)
-        hard_idx = pair_indices[b_idx, branch_idx]
-        return pair_indices, hard_idx
-
     def get_decoder_loss_hard_assign( # EDA
         self,
         modes_preds,                 # list of [B, K]
         preds,                       # list of [K, T, B, 5]
         pred_vels,                   # list of [K, T, B, 2]
-        anchor_pos,                  # [B, K, 2]
-        goal_anchor_pos,             # [B, M, 2], before pair expansion
+        predicted_goal_position,     # [B, K, 2]
         gt_decoder,                  # [B, T, 5] -> (x, y, vx, vy, valid)
         center_gt_final_valid_idx,   # [B]
-        current_epoch=0,
     ):
         device = gt_decoder.device
         B = gt_decoder.size(0)
@@ -205,12 +156,14 @@ class Criterion(nn.Module):
 
             # ---------- Evolving Anchors ----------
             positive_layer_idx = (layer_idx // num_inter_layers) * num_inter_layers - 1
-            uses_goal_anchors = positive_layer_idx < 0
-            if uses_goal_anchors:
+            if positive_layer_idx < 0:
                 # first-stage anchor from SGCP anchors
-                cur_anchor_pos = anchor_pos[:, :pred_scores.size(1)]
+                cur_goal_position = predicted_goal_position[:, :pred_scores.size(1)]
 
-                anchor_trajs = cur_anchor_pos.detach().unsqueeze(2)
+                anchor_trajs = cur_goal_position.detach().unsqueeze(2)
+                dist = (
+                    cur_goal_position.detach() - gt_goal[:, None, :]
+                ).norm(dim=-1)
             else:
                 # use previous anchor trajectories
                 anchor_trajs = preds[positive_layer_idx].permute(2, 0, 1, 3).detach()  # [B, K, T, 5]
@@ -242,26 +195,9 @@ class Criterion(nn.Module):
                     return_mask=True,
                 )
 
-            # Match initial predictions hierarchically: select the SGCP goal
-            # mode first, then compare its regressed/predefined trajectories.
-            with torch.no_grad():
-                if uses_goal_anchors:
-                    pair_indices, matched_idx = self.get_initial_pair_assignment(
-                        pred_trajs=pred_trajs.detach(),
-                        goal_anchor_pos=goal_anchor_pos.detach(),
-                        gt_xy=gt_xy,
-                        gt_mask=gt_mask,
-                        gt_goal=gt_goal,
-                        select_mask=select_mask,
-                    )
-                    in_branch_warmup = current_epoch < self.initial_branch_warmup_epochs
-                    # The predefined mean is fixed in the initial prediction,
-                    # so use the regressed component for trajectory supervision
-                    # while both branches are classification positives.
-                    hard_idx = pair_indices[:, 0] if in_branch_warmup else matched_idx
-                else:
-                    dist = dist.masked_fill(~select_mask, 1e10)
-                    hard_idx = dist.argmin(dim=-1)
+            # Evolving + Distinct
+            dist = dist.masked_fill(~select_mask, 1e10)
+            hard_idx = dist.argmin(dim=-1)
 
             # MTR nll_loss_gmm_direct expects log_std, but MotionRegHead outputs sigma
             mu = pred_trajs[..., :2]
@@ -279,28 +215,6 @@ class Criterion(nn.Module):
                 use_square_gmm=False,
             )
 
-            # Once hard branch matching starts, keep the regressed branch from
-            # starving when the predefined trajectory is currently closer.
-            loss_reg_aux = torch.zeros_like(loss_reg_gmm)
-            if (
-                uses_goal_anchors
-                and not in_branch_warmup
-                and self.initial_reg_aux_weight > 0
-            ):
-                reg_idx = pair_indices[:, 0]
-                predefined_is_positive = hard_idx != reg_idx
-                if predefined_is_positive.any():
-                    loss_reg_aux, _ = self.nll_loss_gmm_direct(
-                        pred_scores=pred_scores,
-                        pred_trajs=pred_trajs_gmm,
-                        gt_trajs=gt_xy,
-                        gt_valid_mask=gt_mask,
-                        pre_nearest_mode_idxs=reg_idx,
-                        timestamp_loss_weight=None,
-                        use_square_gmm=False,
-                    )
-                    loss_reg_aux = loss_reg_aux * predefined_is_positive.float()
-
             pred_xy_pos = mu[b_idx, hard_idx]  # [B, T, 2]
             pred_vel_pos = pred_vel[b_idx, hard_idx]  # [B, T, 2]
             loss_reg_vel = F.l1_loss(pred_vel_pos, gt_vel, reduction='none')
@@ -309,16 +223,11 @@ class Criterion(nn.Module):
 
             # ---------- BCE classification ----------
             bce_target = torch.zeros_like(pred_scores)   # [B, K]
-            if uses_goal_anchors and in_branch_warmup:
-                bce_target.scatter_(1, pair_indices, 1.0)
-            else:
-                bce_target[b_idx, hard_idx] = 1.0
+            bce_target[b_idx, hard_idx] = 1.0
             loss_cls = F.binary_cross_entropy_with_logits(pred_scores, bce_target, reduction='none')  # [B, K]
             loss_cls = (loss_cls * select_mask.float()).sum(dim=-1)                                    # [B]
 
-            layer_loss = w_reg * (
-                loss_reg_gmm + self.initial_reg_aux_weight * loss_reg_aux
-            ) + w_vel * loss_reg_vel + w_cls * loss_cls
+            layer_loss = w_reg * loss_reg_gmm + w_vel * loss_reg_vel + w_cls * loss_cls
             layer_loss = (layer_loss * valid_final).sum() / valid_final.sum().clamp_min(1.0)
             layer_loss = layer_loss + w_acc * loss_acc + w_jerk * loss_jerk + w_curvature * loss_curvature
             total = total + layer_loss
@@ -350,7 +259,7 @@ class Criterion(nn.Module):
             ).square().sum(dim=-1)
             positive_goal_component = goal_distance.argmin(dim=-1)
 
-        return weighted_goal_position, positive_goal_component
+        return positive_goal_component
 
     def get_goal_prob_loss(
         self,
@@ -426,13 +335,13 @@ class Criterion(nn.Module):
 
     def get_goal_fde_loss(
         self,
-        goal_position,
+        predicted_goal_position,
         goal_FDE,
         gt,
         center_gt_final_valid_idx,
     ):
         """
-        goal_position: [K, B, 2], discrete argmax anchor coordinates
+        predicted_goal_position: [B, K, 2], discrete argmax anchor coordinates
         goal_FDE: [B, K]
         gt: [B, T, 5]  # (x, y, vx, vy, valid)
         center_gt_final_valid_idx: [B]
@@ -447,7 +356,7 @@ class Criterion(nn.Module):
 
         # FDE is a detached quality target: it trains the ranking head without
         # leaking gradients into the proposed goal coordinates.
-        final_goal_position = goal_position.permute(1, 0, 2).detach()
+        final_goal_position = predicted_goal_position.detach()
         FDE_gt = torch.norm(
             final_goal_position - gt_goal.unsqueeze(1), p=2, dim=-1
         )

@@ -1099,7 +1099,7 @@ class BEVTrajDecoder(nn.Module):
         mode_query,
         scene_context,
         bev_feat,
-        anchor_pos,
+        predicted_goal_position,
         ego_dyn,
         tc_dyn,
         scene_context_tokens=None,
@@ -1125,10 +1125,11 @@ class BEVTrajDecoder(nn.Module):
 
         # Select the trajectory template whose endpoint is closest to each goal.
         endpoint_distance = (
-            anchor_pos[:, :, None] - self.trajectory_set[None, None, :, -1]
+            predicted_goal_position[:, :, None]
+            - self.trajectory_set[None, None, :, -1]
         ).square().sum(dim=-1)
         trajectory_idx = endpoint_distance.argmin(dim=-1)
-        ref_trajectory = self.trajectory_set[trajectory_idx]  # [B,M,T,2]
+        ref_trajectory = self.trajectory_set[trajectory_idx]  # [B, M, L, 2]
 
         # BEV references use the ego frame.
         steps_per_waypoint = self.T // self.num_waypoints
@@ -1160,13 +1161,7 @@ class BEVTrajDecoder(nn.Module):
                 ref_points=ref_waypoints,
             )
         )
-        mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))
-
-        # The two candidates share localization features and differ only in
-        # their initial XY trajectory, so expand modes after BEV localization.
-        mode_embed = mode_embed.repeat_interleave(2, dim=0)
-        ref_trajectory = ref_trajectory.repeat_interleave(2, dim=1)
-        M = mode_embed.size(0)
+        mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))  # [M,B,12,D]
 
         # ===================== state consistency branch =====================
         t = (self.future_time * self.dt + 0.1).to(
@@ -1194,25 +1189,13 @@ class BEVTrajDecoder(nn.Module):
             B, 1, self.num_waypoints, steps_per_waypoint, self.D
         )
 
-        dec_embed_T = mode_bt + state_bt
+        dec_embed_T = mode_bt + state_bt  # [B,M,12,5,D]
         dec_embed_T = dec_embed_T.reshape(B, M, self.T, self.D)
         dec_embed_T = dec_embed_T.permute(1, 0, 2, 3).contiguous()
 
         # ===================== trajectory prediction =====================
         out_dist = self.motion_reg_l1(dec_embed_T)  # [M,B,T,5]
         out_vel = self.motion_vel_l1(dec_embed_T)  # [M,B,T,2]
-
-        # Candidate ordering is [regressed, predefined] for every proposal
-        # mode. Keep the learned Gaussian scale/correlation parameters on both
-        # candidates, replacing only the predefined candidate's XY mean.
-        predefined_xy = ref_trajectory.permute(1, 0, 2, 3).to(
-            dtype=out_dist.dtype
-        ).contiguous()
-        use_predefined = (
-            torch.arange(M, device=out_dist.device) % 2 == 1
-        ).view(M, 1, 1, 1)
-        out_xy = torch.where(use_predefined, predefined_xy, out_dist[..., :2])
-        out_dist = torch.cat([out_xy, out_dist[..., 2:]], dim=-1)
         mode_prob = self.score_predicted_trajectory(
             dec_embed=dec_embed_T,
             pred_traj=out_dist,
@@ -1260,8 +1243,8 @@ class BEVTrajDecoder(nn.Module):
                 agent_history,
                 target_idx,
             )
-        anchor_pos = goal_position.permute(1, 0, 2).contiguous()
-        anchor_pos_detached = anchor_pos.detach()
+        predicted_goal_position = goal_position.permute(1, 0, 2).contiguous()
+        predicted_goal_position_detached = predicted_goal_position.detach()
 
         # -------------------- Initial Prediction --------------------
         dec_embed, init_mode_prob, init_pred_traj, init_pred_vel, state_pred = \
@@ -1269,7 +1252,7 @@ class BEVTrajDecoder(nn.Module):
                 mode_query,
                 scene_context,
                 bev_feat,
-                anchor_pos_detached,
+                predicted_goal_position_detached,
                 ego_dyn,
                 tc_dyn,
                 scene_context_tokens=scene_context_tokens,
@@ -1277,11 +1260,6 @@ class BEVTrajDecoder(nn.Module):
                 obj_valid_mask=obj_valid_mask,
                 target_idx=target_idx,
             )
-            # self.initial_prediction(mode_query, scene_context, bev_feat, anchor_pos, ego_dyn)
-
-        # Initial prediction expands each goal proposal into a regressed/template
-        # pair, so expose matching first-stage anchors to EDA and validation NMS.
-        anchor_pos = anchor_pos.repeat_interleave(2, dim=1)
         
         mode_probs = [init_mode_prob]
         pred_trajs = [init_pred_traj.permute(0, 2, 1, 3)]
@@ -1345,8 +1323,7 @@ class BEVTrajDecoder(nn.Module):
         output = {'predicted_probability': mode_probs,
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
-                  'anchor_pos' : anchor_pos,
-                  'predicted_goal_position': goal_position,
+                  'predicted_goal_position': predicted_goal_position,
                   'predicted_goal_probability': goal_probability,
                   'goal_anchor_position': goal_anchor_position,
                   'predicted_goal_FDE': goal_FDE,

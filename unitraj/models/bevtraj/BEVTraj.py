@@ -98,7 +98,7 @@ class BEVTraj(BaseModel):
         
         print("BEVTraj model initialized.")
         
-    def forward(self, batch, is_validation, current_epoch=0):
+    def forward(self, batch, is_validation):
         traj_data = batch['traj_data']['input_dict']
         # bev_feat_raw = batch['bev_feat']
         ec_dynamics, tc_dynamics, ego_dynamics, agent_history = \
@@ -132,20 +132,22 @@ class BEVTraj(BaseModel):
         
         # get loss
         output['dense_future_pred'] = dense_future_pred
-        loss = self.get_loss(traj_data, output, current_epoch=current_epoch)
+        loss = self.get_loss(traj_data, output)
         
         last_logit = output['predicted_probability'][-1]
         last_prob = F.softmax(last_logit, dim=-1)
         initial_traj = output['predicted_trajectory'][0].permute(2, 0, 1, 3)
         last_traj = output['predicted_trajectory'][-1].permute(2, 0, 1, 3)
 
-        anchor_pos = output['anchor_pos']
-        goal_position = anchor_pos.permute(1, 0, 2).contiguous()
+        predicted_goal_position = output['predicted_goal_position']
+        goal_position = predicted_goal_position.permute(1, 0, 2).contiguous()
         if is_validation:
             last_traj, last_prob, ret_idxs = batch_nms(last_traj, last_prob, dist_thresh=2.5, num_ret_modes=10)
             batch_idx = torch.arange(B, device=ret_idxs.device)[:, None]
             initial_traj = initial_traj[batch_idx, ret_idxs]
-            goal_position = anchor_pos[batch_idx, ret_idxs].permute(1, 0, 2).contiguous()
+            goal_position = predicted_goal_position[
+                batch_idx, ret_idxs
+            ].permute(1, 0, 2).contiguous()
         
         prediction = {'predicted_probability': last_prob,
                       'initial_predicted_trajectory': initial_traj,
@@ -156,7 +158,7 @@ class BEVTraj(BaseModel):
         return prediction, loss
 
     
-    def get_loss(self, traj_data, prediction, current_epoch=0):
+    def get_loss(self, traj_data, prediction):
         ground_truth = []
         decoder_gt = torch.cat(
             [traj_data['center_gt_trajs'], traj_data['center_gt_trajs_mask'].unsqueeze(-1)],
@@ -165,13 +167,7 @@ class BEVTraj(BaseModel):
         ground_truth.append(decoder_gt)
         dense_future_gt = {'obj_trajs_future_state': traj_data['obj_trajs_future_state'], 'obj_trajs_future_mask': traj_data['obj_trajs_future_mask']}
         ground_truth.append(dense_future_gt)
-        loss = self.criterion(
-            prediction,
-            ground_truth,
-            traj_data['center_gt_final_valid_idx'],
-            traj_data,
-            current_epoch=current_epoch,
-        )
+        loss = self.criterion(prediction, ground_truth, traj_data['center_gt_final_valid_idx'], traj_data)
         
         return loss
     
@@ -240,19 +236,11 @@ class BEVTraj(BaseModel):
         return [optimizer], [scheduler]
     
     def training_step(self, batch, batch_idx):
-        prediction, loss = self.forward(
-            batch,
-            is_validation=False,
-            current_epoch=self.current_epoch,
-        )
+        prediction, loss = self.forward(batch, is_validation=False)
         self.log_info(batch['traj_data'], batch_idx, prediction, status='train')
         return loss
 
     def validation_step(self, batch, batch_idx):
-        prediction, loss = self.forward(
-            batch,
-            is_validation=True,
-            current_epoch=self.current_epoch,
-        )
+        prediction, loss = self.forward(batch, is_validation=True)
         self.log_info(batch['traj_data'], batch_idx, prediction, status='val')
         return loss
