@@ -15,6 +15,15 @@ class Criterion(nn.Module):
         self.curvature_min_speed = float(self.config.get('curvature_min_speed', 0.5))
         self.inv_smoothness_dt2 = 1.0 / (self.smoothness_dt ** 2)
         self.inv_smoothness_dt3 = 1.0 / (self.smoothness_dt ** 3)
+        self.goal_prob_lateral_sigma = float(
+            self.config.get(
+                'goal_prob_lateral_sigma',
+                self.config.get('goal_prob_sigma', 2.5),
+            )
+        )
+        self.goal_prob_progress_sigma = float(
+            self.config.get('goal_prob_progress_sigma', 8.0)
+        )
 
     def get_trajectory_smoothness_loss(self, pred_xy, valid_mask):
         valid_mask = valid_mask.to(pred_xy.dtype)
@@ -235,29 +244,170 @@ class Criterion(nn.Module):
         return total / num_layers
     
     @staticmethod
+    def _get_goal_path_cost(
+        goal_position,
+        gt,
+        center_gt_final_valid_idx,
+        lateral_sigma,
+        progress_sigma,
+    ):
+        """
+        Compute a Frenet-like cost between goals and the valid GT path.
+
+        The current target position (the local-coordinate origin) is prepended
+        to the future GT trajectory. Goals are projected onto the resulting
+        polyline and penalized separately by lateral distance and remaining
+        path progress. The first and last non-degenerate segments are extended
+        so that goals behind the start or beyond the endpoint still receive an
+        along-path progress error instead of an isotropic endpoint error.
+
+        Args:
+            goal_position: [B, ..., 2]
+            gt: [B, T, 5], with validity in the last channel
+            center_gt_final_valid_idx: [B]
+        Returns:
+            cost: [B, ...]
+        """
+        B = gt.size(0)
+        assert goal_position.shape[0] == B
+        assert goal_position.shape[-1] == 2
+
+        original_shape = goal_position.shape[1:-1]
+        goals = goal_position.reshape(B, -1, 2)
+        gt_xy = gt[..., :2].to(goal_position.dtype)
+        gt_valid = gt[..., -1].bool()
+
+        origin = torch.zeros(
+            B, 1, 2, device=goal_position.device, dtype=goal_position.dtype
+        )
+        path_points = torch.cat([origin, gt_xy], dim=1)
+        point_valid = torch.cat(
+            [
+                torch.ones(B, 1, device=gt.device, dtype=torch.bool),
+                gt_valid,
+            ],
+            dim=1,
+        )
+
+        segment_start = path_points[:, :-1]
+        segment_delta = path_points[:, 1:] - segment_start
+        segment_length = segment_delta.norm(dim=-1)
+        segment_valid = (
+            point_valid[:, :-1]
+            & point_valid[:, 1:]
+            & (segment_length > 1e-6)
+        )
+
+        segment_length_sq = segment_delta.square().sum(dim=-1)
+        relative = goals[:, :, None, :] - segment_start[:, None, :, :]
+        raw_t = (
+            relative * segment_delta[:, None, :, :]
+        ).sum(dim=-1) / segment_length_sq[:, None, :].clamp_min(1e-12)
+        clamped_t = raw_t.clamp(0.0, 1.0)
+
+        bounded_projection = (
+            segment_start[:, None, :, :]
+            + clamped_t[..., None] * segment_delta[:, None, :, :]
+        )
+        bounded_sq_dist = (
+            goals[:, :, None, :] - bounded_projection
+        ).square().sum(dim=-1)
+        bounded_sq_dist = bounded_sq_dist.masked_fill(
+            ~segment_valid[:, None, :], float('inf')
+        )
+        selected_segment = bounded_sq_dist.argmin(dim=-1)
+
+        gather_idx = selected_segment[..., None]
+        selected_raw_t = raw_t.gather(2, gather_idx).squeeze(-1)
+        selected_clamped_t = clamped_t.gather(2, gather_idx).squeeze(-1)
+
+        segment_order = torch.arange(
+            segment_valid.size(1), device=gt.device
+        )[None]
+        first_segment = segment_valid.long().argmax(dim=-1)
+        last_segment = (
+            segment_order * segment_valid.long()
+        ).max(dim=-1).values
+        extrapolate = (
+            (selected_segment == first_segment[:, None])
+            & (selected_raw_t < 0.0)
+        ) | (
+            (selected_segment == last_segment[:, None])
+            & (selected_raw_t > 1.0)
+        )
+        selected_t = torch.where(
+            extrapolate, selected_raw_t, selected_clamped_t
+        )
+
+        selected_start = segment_start.gather(
+            1, selected_segment[..., None].expand(-1, -1, 2)
+        )
+        selected_delta = segment_delta.gather(
+            1, selected_segment[..., None].expand(-1, -1, 2)
+        )
+        projection = selected_start + selected_t[..., None] * selected_delta
+        lateral_sq_dist = (
+            goals - projection
+        ).square().sum(dim=-1)
+
+        valid_segment_length = segment_length * segment_valid
+        segment_end_progress = valid_segment_length.cumsum(dim=-1)
+        segment_start_progress = (
+            segment_end_progress - valid_segment_length
+        )
+        selected_start_progress = segment_start_progress.gather(
+            1, selected_segment
+        )
+        selected_length = segment_length.gather(1, selected_segment)
+        projected_progress = (
+            selected_start_progress + selected_t * selected_length
+        )
+        total_progress = segment_end_progress[:, -1]
+        progress_error = projected_progress - total_progress[:, None]
+
+        cost = (
+            0.5 * lateral_sq_dist / (lateral_sigma ** 2)
+            + 0.5 * progress_error.square() / (progress_sigma ** 2)
+        )
+
+        # Rows without a non-degenerate valid segment correspond to stationary
+        # (or invalid) GT. Use the endpoint distance for stationary rows; the
+        # caller masks invalid rows from the final loss.
+        has_path = segment_valid.any(dim=-1)
+        b_idx = torch.arange(B, device=gt.device)
+        final_idx = center_gt_final_valid_idx.long()
+        gt_goal = gt_xy[b_idx, final_idx]
+        endpoint_cost = (
+            goals - gt_goal[:, None]
+        ).square().sum(dim=-1) * (0.5 / (lateral_sigma ** 2))
+        cost = torch.where(has_path[:, None], cost, endpoint_cost)
+
+        return cost.reshape(B, *original_shape)
+
     def get_positive_goal_component(
+        self,
         goal_probability,
         goal_anchor_position,
         gt,
         center_gt_final_valid_idx,
     ):
-        """Hard-assign each sample to the closest weighted goal component."""
+        """Hard-assign each sample using the weighted goal's GT-path cost."""
         B, K, A = goal_probability.shape
         assert goal_anchor_position.shape == (B, K, A, 2)
-
-        b_idx = torch.arange(B, device=goal_probability.device)
-        final_idx = center_gt_final_valid_idx.long()
-        gt_goal = gt[b_idx, final_idx, :2]
 
         with torch.no_grad():
             weighted_goal_position = (
                 goal_probability.detach().unsqueeze(-1)
                 * goal_anchor_position.detach()
             ).sum(dim=2)
-            goal_distance = (
-                weighted_goal_position - gt_goal[:, None]
-            ).square().sum(dim=-1)
-            positive_goal_component = goal_distance.argmin(dim=-1)
+            goal_path_cost = self._get_goal_path_cost(
+                goal_position=weighted_goal_position,
+                gt=gt,
+                center_gt_final_valid_idx=center_gt_final_valid_idx,
+                lateral_sigma=self.goal_prob_lateral_sigma,
+                progress_sigma=self.goal_prob_progress_sigma,
+            )
+            positive_goal_component = goal_path_cost.argmin(dim=-1)
 
         return positive_goal_component
 
@@ -273,9 +423,6 @@ class Criterion(nn.Module):
         eps = 1e-9
         entropy_weight = float(self.config.get('entropy_weight', 0.3))
         kl_weight = float(self.config.get('kl_weight', 1.0))
-        sigma = float(self.config.get('goal_prob_sigma', 2.0))
-        if sigma <= 0:
-            raise ValueError('goal_prob_sigma must be positive')
 
         B, K, A = goal_probability.shape
         assert goal_anchor_position.shape == (B, K, A, 2)
@@ -284,7 +431,6 @@ class Criterion(nn.Module):
         device = goal_probability.device
         b_idx = torch.arange(B, device=device)
         final_idx = center_gt_final_valid_idx.long()
-        gt_goal = gt[b_idx, final_idx, :2]
         valid_final = gt[b_idx, final_idx, -1].float()
         valid_count = valid_final.sum().clamp_min(1.0)
 
@@ -294,12 +440,16 @@ class Criterion(nn.Module):
             b_idx, positive_goal_component
         ]
 
-        # Isotropic Gaussian likelihood p(goal_gt | anchor), with its constant
-        # omitted because it cancels during posterior normalization.
-        sq_dist = (
-            goal_anchor_position - gt_goal[:, None]
-        ).square().sum(dim=-1)
-        log_likelihood = -0.5 * sq_dist / (sigma ** 2)
+        # Anisotropic path-tube likelihood: deviations across the GT path are
+        # penalized more strongly than along-path progress (speed) errors.
+        path_cost = self._get_goal_path_cost(
+            goal_position=goal_anchor_position,
+            gt=gt,
+            center_gt_final_valid_idx=center_gt_final_valid_idx,
+            lateral_sigma=self.goal_prob_lateral_sigma,
+            progress_sigma=self.goal_prob_progress_sigma,
+        )
+        log_likelihood = -path_cost
 
         # q(anchor) is the GT-conditioned posterior formed from the predicted
         # prior and the spatial likelihood.

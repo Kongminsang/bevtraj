@@ -208,6 +208,33 @@ class BEVTrajDecoder(nn.Module):
         self.score_time_full_refine_layers = int(
             config.get('score_time_full_refine_layers', 1)
         )
+        self.refinement_smoothing_kernel_size = int(
+            config.get('refinement_smoothing_kernel_size', 7)
+        )
+        self.refinement_smoothing_sigma = float(
+            config.get('refinement_smoothing_sigma', 1.5)
+        )
+        self.refinement_smoothing_alpha = float(
+            config.get('refinement_smoothing_alpha', 0.0)
+        )
+
+        smoothing_radius = self.refinement_smoothing_kernel_size // 2
+        smoothing_steps = torch.arange(
+            -smoothing_radius,
+            smoothing_radius + 1,
+            dtype=torch.float32,
+        )
+        smoothing_kernel = torch.exp(
+            -0.5 * (
+                smoothing_steps / self.refinement_smoothing_sigma
+            ).square()
+        )
+        smoothing_kernel = smoothing_kernel / smoothing_kernel.sum()
+        self.register_buffer(
+            'refinement_smoothing_kernel',
+            smoothing_kernel.view(1, 1, -1),
+            persistent=False,
+        )
         
         self.dca_cfg = config['deform_cross_attn']
         self.dca_cfg['dim'] = self.D
@@ -476,6 +503,44 @@ class BEVTrajDecoder(nn.Module):
         pe = pe.reshape(self.T, B * K, self.D)  # [T,BK,D]
 
         return self.time_emb_alpha * pe
+
+    def smooth_refinement_offset(self, raw_offset):
+        """Apply fixed residual Gaussian smoothing along the time dimension."""
+        assert raw_offset.ndim == 4
+        assert raw_offset.size(2) == self.T
+        assert raw_offset.size(3) == 2
+
+        if (
+            self.refinement_smoothing_alpha == 0.0
+            or self.refinement_smoothing_kernel_size == 1
+        ):
+            return raw_offset
+
+        num_modes, batch_size, num_steps, _ = raw_offset.shape
+        offset_channels = raw_offset.permute(0, 1, 3, 2).reshape(
+            num_modes * batch_size, 2, num_steps
+        )
+        smoothing_radius = self.refinement_smoothing_kernel_size // 2
+        offset_channels = F.pad(
+            offset_channels,
+            (smoothing_radius, smoothing_radius),
+            mode='replicate',
+        )
+        kernel = self.refinement_smoothing_kernel.to(
+            dtype=raw_offset.dtype
+        ).expand(2, -1, -1).contiguous()
+        smooth_offset = F.conv1d(
+            offset_channels,
+            kernel,
+            groups=2,
+        )
+        smooth_offset = smooth_offset.reshape(
+            num_modes, batch_size, 2, num_steps
+        ).permute(0, 1, 3, 2).contiguous()
+
+        return raw_offset + self.refinement_smoothing_alpha * (
+            smooth_offset - raw_offset
+        )
 
     @staticmethod
     def precompute_goal_anchor_headings(anchors, trajectories, chord_steps=5):
@@ -1289,7 +1354,10 @@ class BEVTrajDecoder(nn.Module):
                 )
             
             pred_traj_raw = self.motion_reg(dec_embed)          # [K, B, T, 5]
-            pred_xy = pred_traj_raw[..., :2] + ref_points       # out-of-place
+            refinement_offset = self.smooth_refinement_offset(
+                pred_traj_raw[..., :2]
+            )
+            pred_xy = refinement_offset + ref_points            # out-of-place
             pred_traj = torch.cat([pred_xy, pred_traj_raw[..., 2:]], dim=-1)
             ref_points = pred_xy.detach().clone()
 
