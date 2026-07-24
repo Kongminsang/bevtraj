@@ -306,6 +306,15 @@ class BEVTrajDecoder(nn.Module):
         self.goal_flow_conditioner = QueryConditionedDynamics(self.D, self.D)
         self.goal_flow_score_proj = MLP(self.D, self.D, self.goal_score_hidden_dim, 2)
         self.goal_score_fusion = MLP(2 * self.goal_score_hidden_dim, self.goal_score_hidden_dim, 1, 2)
+        self.goal_motion_encoder = MLP(self.target_attr, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
+        self.goal_motion_time_encoder = MLP(1, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
+        self.goal_motion_attn = nn.MultiheadAttention(self.goal_score_hidden_dim, 4, dropout=0.0, batch_first=True)
+        self.goal_motion_pool = MLP(2 * self.goal_score_hidden_dim, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
+        self.goal_motion_score = MLP(self.D + self.goal_score_hidden_dim, self.goal_score_hidden_dim, 1, 3)
+        nn.init.zeros_(self.goal_motion_score.layers[-1].weight)
+        nn.init.zeros_(self.goal_motion_score.layers[-1].bias)
+        history_time = (torch.arange(self.t, dtype=torch.float32) - self.t + 1) * float(config.get('dt', 0.1))
+        self.register_buffer('goal_history_time', history_time.unsqueeze(-1), persistent=False)
 
         # The selected anchor evidence is fused back into the downstream mode
         # representation so the hard goal and mode semantics stay aligned.
@@ -755,9 +764,25 @@ class BEVTrajDecoder(nn.Module):
         flow_score_feature = self.goal_flow_score_proj(conditioned_flow_token)
         score_features.append(flow_score_feature * flow_presence)
 
-        goal_logits = self.goal_score_fusion(torch.cat(score_features, dim=-1)).squeeze(-1)
-        goal_probability = goal_logits.float().softmax(dim=-1)
         goal_anchor_position = bda_pos[:, self.goal_anchor_indices]
+        motion_tokens = self.goal_motion_encoder(tc_dyn)
+        motion_time_pe = self.goal_motion_time_encoder(self.goal_history_time.to(motion_tokens.dtype))[None].expand(B, -1, -1)
+        target_valid_mask = agent_history['valid_mask'][torch.arange(B, device=target_idx.device), target_idx]
+        attended_motion = self.goal_motion_attn(
+            motion_tokens[:, -1:] + motion_time_pe[:, -1:],
+            motion_tokens + motion_time_pe,
+            motion_tokens,
+            key_padding_mask=~target_valid_mask,
+            need_weights=False,
+        )[0][:, 0]
+        motion_context = self.goal_motion_pool(torch.cat([motion_tokens[:, -1], attended_motion], dim=-1))
+        motion_context = motion_context[:, None, None].expand(-1, self.K, goal_anchor_position.size(2), -1)
+        motion_logits = self.goal_motion_score(
+            torch.cat([bda_pos_embed[:, self.goal_anchor_indices], motion_context], dim=-1)
+        ).squeeze(-1)
+        scene_goal_logits = self.goal_score_fusion(torch.cat(score_features, dim=-1)).squeeze(-1)
+        goal_logits = scene_goal_logits + motion_logits
+        goal_probability = goal_logits.float().softmax(dim=-1)
 
         # Select the argmax anchor without a straight-through gradient.
         # The anchor scorer is trained only through its explicit probability
