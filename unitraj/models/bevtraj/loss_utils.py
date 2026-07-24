@@ -15,24 +15,9 @@ class Criterion(nn.Module):
         self.curvature_min_speed = float(self.config.get('curvature_min_speed', 0.5))
         self.inv_smoothness_dt2 = 1.0 / (self.smoothness_dt ** 2)
         self.inv_smoothness_dt3 = 1.0 / (self.smoothness_dt ** 3)
-        self.goal_prob_lateral_sigma = float(
-            self.config.get(
-                'goal_prob_lateral_sigma',
-                self.config.get('goal_prob_sigma', 2.5),
-            )
-        )
-        self.goal_prob_progress_sigma = float(
-            self.config.get('goal_prob_progress_sigma', 8.0)
-        )
-        self.goal_prob_match_cost_margin = float(
-            self.config.get('goal_prob_match_cost_margin', 0.1)
-        )
-        self.goal_prob_match_temperature = float(
-            self.config.get('goal_prob_match_temperature', 0.1)
-        )
-        self.goal_prob_max_extra_modes = int(
-            self.config.get('goal_prob_max_extra_modes', 2)
-        )
+        default_goal_sigma = self.config.get('goal_prob_sigma', 2.5)
+        self.goal_prob_lateral_sigma = float(self.config.get('goal_prob_lateral_sigma', default_goal_sigma))
+        self.goal_prob_progress_sigma = float(self.config.get('goal_prob_progress_sigma', 8.0))
 
     def get_trajectory_smoothness_loss(self, pred_xy, valid_mask):
         valid_mask = valid_mask.to(pred_xy.dtype)
@@ -53,10 +38,7 @@ class Criterion(nn.Module):
         # displacements that are both above the configured speed threshold.
         disp_norm = torch.norm(disp, dim=-1)
         min_disp = self.curvature_min_speed * self.smoothness_dt
-        direction_valid = (
-            (disp_norm[:, :-1] > min_disp)
-            & (disp_norm[:, 1:] > min_disp)
-        ).to(pred_xy.dtype)
+        direction_valid = ((disp_norm[:, :-1] > min_disp) & (disp_norm[:, 1:] > min_disp)).to(pred_xy.dtype)
         curvature_valid = accel_valid * direction_valid
 
         vel_hat = disp / disp_norm.unsqueeze(-1).clamp_min(1e-6)
@@ -84,13 +66,9 @@ class Criterion(nn.Module):
         gt_decoder = gt[0]
         gt_dense_future_trajs = gt[1]
 
-        positive_goal_component = \
-            self.get_positive_goal_component(
-                goal_probability=goal_probability,
-                goal_anchor_position=goal_anchor_position,
-                gt=gt_decoder,
-                center_gt_final_valid_idx=center_gt_final_valid_idx,
-            )
+        positive_goal_component = self.get_positive_goal_component(
+            predicted_goal_position, gt_decoder, center_gt_final_valid_idx
+        )
         
         decoder_loss = self.get_decoder_loss_hard_assign(
             modes_preds=modes_preds,
@@ -116,20 +94,11 @@ class Criterion(nn.Module):
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
 
-        state_query_loss = self.get_state_query_loss(
-            state_pred=state_pred,
-            gt=gt_decoder,
-        )
+        state_query_loss = self.get_state_query_loss(state_pred=state_pred, gt=gt_decoder)
 
         dense_future_loss = self.get_dense_future_prediction_loss(dense_future_pred, gt_dense_future_trajs)
 
-        total_loss = (
-            decoder_loss
-            + goal_prob_loss
-            + goal_fde_loss
-            + state_query_loss
-            + dense_future_loss
-        )
+        total_loss = decoder_loss + goal_prob_loss + goal_fde_loss + state_query_loss + dense_future_loss
         return total_loss
 
     def get_decoder_loss_hard_assign( # EDA
@@ -179,9 +148,7 @@ class Criterion(nn.Module):
                 cur_goal_position = predicted_goal_position[:, :pred_scores.size(1)]
 
                 anchor_trajs = cur_goal_position.detach().unsqueeze(2)
-                dist = (
-                    cur_goal_position.detach() - gt_goal[:, None, :]
-                ).norm(dim=-1)
+                dist = (cur_goal_position.detach() - gt_goal[:, None, :]).norm(dim=-1)
             else:
                 # use previous anchor trajectories
                 anchor_trajs = preds[positive_layer_idx].permute(2, 0, 1, 3).detach()  # [B, K, T, 5]
@@ -286,57 +253,36 @@ class Criterion(nn.Module):
         gt_xy = gt[..., :2].to(goal_position.dtype)
         gt_valid = gt[..., -1].bool()
 
-        origin = torch.zeros(
-            B, 1, 2, device=goal_position.device, dtype=goal_position.dtype
-        )
+        origin = torch.zeros(B, 1, 2, device=goal_position.device, dtype=goal_position.dtype)
         path_points = torch.cat([origin, gt_xy], dim=1)
         point_valid = torch.cat(
-            [
-                torch.ones(B, 1, device=gt.device, dtype=torch.bool),
-                gt_valid,
-            ],
+            [torch.ones(B, 1, device=gt.device, dtype=torch.bool), gt_valid],
             dim=1,
         )
 
         segment_start = path_points[:, :-1]
         segment_delta = path_points[:, 1:] - segment_start
         segment_length = segment_delta.norm(dim=-1)
-        segment_valid = (
-            point_valid[:, :-1]
-            & point_valid[:, 1:]
-            & (segment_length > 1e-6)
-        )
+        segment_valid = point_valid[:, :-1] & point_valid[:, 1:] & (segment_length > 1e-6)
 
         segment_length_sq = segment_delta.square().sum(dim=-1)
         relative = goals[:, :, None, :] - segment_start[:, None, :, :]
-        raw_t = (
-            relative * segment_delta[:, None, :, :]
-        ).sum(dim=-1) / segment_length_sq[:, None, :].clamp_min(1e-12)
+        raw_t = (relative * segment_delta[:, None]).sum(dim=-1)
+        raw_t = raw_t / segment_length_sq[:, None].clamp_min(1e-12)
         clamped_t = raw_t.clamp(0.0, 1.0)
 
-        bounded_projection = (
-            segment_start[:, None, :, :]
-            + clamped_t[..., None] * segment_delta[:, None, :, :]
-        )
-        bounded_sq_dist = (
-            goals[:, :, None, :] - bounded_projection
-        ).square().sum(dim=-1)
-        bounded_sq_dist = bounded_sq_dist.masked_fill(
-            ~segment_valid[:, None, :], float('inf')
-        )
+        bounded_projection = segment_start[:, None] + clamped_t[..., None] * segment_delta[:, None]
+        bounded_sq_dist = (goals[:, :, None] - bounded_projection).square().sum(dim=-1)
+        bounded_sq_dist = bounded_sq_dist.masked_fill(~segment_valid[:, None], float('inf'))
         selected_segment = bounded_sq_dist.argmin(dim=-1)
 
         gather_idx = selected_segment[..., None]
         selected_raw_t = raw_t.gather(2, gather_idx).squeeze(-1)
         selected_clamped_t = clamped_t.gather(2, gather_idx).squeeze(-1)
 
-        segment_order = torch.arange(
-            segment_valid.size(1), device=gt.device
-        )[None]
+        segment_order = torch.arange(segment_valid.size(1), device=gt.device)[None]
         first_segment = segment_valid.long().argmax(dim=-1)
-        last_segment = (
-            segment_order * segment_valid.long()
-        ).max(dim=-1).values
+        last_segment = (segment_order * segment_valid.long()).max(dim=-1).values
         extrapolate = (
             (selected_segment == first_segment[:, None])
             & (selected_raw_t < 0.0)
@@ -344,33 +290,20 @@ class Criterion(nn.Module):
             (selected_segment == last_segment[:, None])
             & (selected_raw_t > 1.0)
         )
-        selected_t = torch.where(
-            extrapolate, selected_raw_t, selected_clamped_t
-        )
+        selected_t = torch.where(extrapolate, selected_raw_t, selected_clamped_t)
 
-        selected_start = segment_start.gather(
-            1, selected_segment[..., None].expand(-1, -1, 2)
-        )
-        selected_delta = segment_delta.gather(
-            1, selected_segment[..., None].expand(-1, -1, 2)
-        )
+        gather_index = selected_segment[..., None].expand(-1, -1, 2)
+        selected_start = segment_start.gather(1, gather_index)
+        selected_delta = segment_delta.gather(1, gather_index)
         projection = selected_start + selected_t[..., None] * selected_delta
-        lateral_sq_dist = (
-            goals - projection
-        ).square().sum(dim=-1)
+        lateral_sq_dist = (goals - projection).square().sum(dim=-1)
 
         valid_segment_length = segment_length * segment_valid
         segment_end_progress = valid_segment_length.cumsum(dim=-1)
-        segment_start_progress = (
-            segment_end_progress - valid_segment_length
-        )
-        selected_start_progress = segment_start_progress.gather(
-            1, selected_segment
-        )
+        segment_start_progress = segment_end_progress - valid_segment_length
+        selected_start_progress = segment_start_progress.gather(1, selected_segment)
         selected_length = segment_length.gather(1, selected_segment)
-        projected_progress = (
-            selected_start_progress + selected_t * selected_length
-        )
+        projected_progress = selected_start_progress + selected_t * selected_length
         total_progress = segment_end_progress[:, -1]
         progress_error = projected_progress - total_progress[:, None]
 
@@ -386,37 +319,22 @@ class Criterion(nn.Module):
         b_idx = torch.arange(B, device=gt.device)
         final_idx = center_gt_final_valid_idx.long()
         gt_goal = gt_xy[b_idx, final_idx]
-        endpoint_cost = (
-            goals - gt_goal[:, None]
-        ).square().sum(dim=-1) * (0.5 / (lateral_sigma ** 2))
+        endpoint_cost = (goals - gt_goal[:, None]).square().sum(dim=-1) * (0.5 / (lateral_sigma ** 2))
         cost = torch.where(has_path[:, None], cost, endpoint_cost)
 
         return cost.reshape(B, *original_shape)
 
-    def get_positive_goal_component(
-        self,
-        goal_probability,
-        goal_anchor_position,
-        gt,
-        center_gt_final_valid_idx,
-    ):
-        """Hard-assign each sample using the weighted goal's GT-path cost."""
-        B, K, A = goal_probability.shape
-        assert goal_anchor_position.shape == (B, K, A, 2)
+    def get_positive_goal_component(self, predicted_goal_position, gt, center_gt_final_valid_idx):
+        """Match the discrete predicted goal closest to the GT endpoint."""
+        B, K, coordinate_dim = predicted_goal_position.shape
+        assert coordinate_dim == 2
+        assert gt.size(0) == B
 
         with torch.no_grad():
-            weighted_goal_position = (
-                goal_probability.detach().unsqueeze(-1)
-                * goal_anchor_position.detach()
-            ).sum(dim=2)
-            goal_path_cost = self._get_goal_path_cost(
-                goal_position=weighted_goal_position,
-                gt=gt,
-                center_gt_final_valid_idx=center_gt_final_valid_idx,
-                lateral_sigma=self.goal_prob_lateral_sigma,
-                progress_sigma=self.goal_prob_progress_sigma,
-            )
-            positive_goal_component = goal_path_cost.argmin(dim=-1)
+            b_idx = torch.arange(B, device=gt.device)
+            gt_goal = gt[b_idx, center_gt_final_valid_idx.long(), :2].to(predicted_goal_position.dtype)
+            goal_distance = (predicted_goal_position.detach() - gt_goal[:, None]).norm(dim=-1)
+            positive_goal_component = goal_distance.argmin(dim=-1)
 
         return positive_goal_component
 
@@ -428,13 +346,7 @@ class Criterion(nn.Module):
         gt,
         center_gt_final_valid_idx,
     ):
-        """
-        Train the best goal mode and up to a few near-optimal modes.
-
-        Matching is detached and uses the same weighted-goal path cost as the
-        hard assignment. Only modes within a small relative cost margin are
-        added, and their losses are down-weighted according to the cost gap.
-        """
+        """Train only the hard-assigned mode's distribution over its anchors."""
         eps = 1e-9
         entropy_weight = float(self.config.get('entropy_weight', 0.3))
         kl_weight = float(self.config.get('kl_weight', 1.0))
@@ -449,80 +361,9 @@ class Criterion(nn.Module):
         valid_final = gt[b_idx, final_idx, -1].float()
         valid_count = valid_final.sum().clamp_min(1.0)
 
-        # Keep the hard positive and add at most N other modes whose detached
-        # weighted goals are nearly tied with it under the same path cost.
-        with torch.no_grad():
-            weighted_goal_position = (
-                goal_probability.detach().unsqueeze(-1)
-                * goal_anchor_position.detach()
-            ).sum(dim=2)
-            matching_cost = self._get_goal_path_cost(
-                goal_position=weighted_goal_position,
-                gt=gt,
-                center_gt_final_valid_idx=center_gt_final_valid_idx,
-                lateral_sigma=self.goal_prob_lateral_sigma,
-                progress_sigma=self.goal_prob_progress_sigma,
-            )
-            best_cost = matching_cost.gather(
-                1, positive_goal_component[:, None]
-            )
-            cost_gap = matching_cost - best_cost
-
-            extra_candidate = (
-                cost_gap <= self.goal_prob_match_cost_margin
-            )
-            extra_candidate.scatter_(
-                1, positive_goal_component[:, None], False
-            )
-
-            num_extra = min(self.goal_prob_max_extra_modes, max(K - 1, 0))
-            if num_extra > 0:
-                extra_cost = matching_cost.masked_fill(
-                    ~extra_candidate, float('inf')
-                )
-                extra_cost, extra_idx = extra_cost.topk(
-                    k=num_extra, dim=-1, largest=False, sorted=True
-                )
-                extra_valid = torch.isfinite(extra_cost)
-                selected_component = torch.cat(
-                    [positive_goal_component[:, None], extra_idx], dim=-1
-                )
-                selected_valid = torch.cat(
-                    [
-                        torch.ones(
-                            B, 1, device=device, dtype=torch.bool
-                        ),
-                        extra_valid,
-                    ],
-                    dim=-1,
-                )
-            else:
-                selected_component = positive_goal_component[:, None]
-                selected_valid = torch.ones(
-                    B, 1, device=device, dtype=torch.bool
-                )
-
-            selected_cost_gap = cost_gap.gather(
-                1, selected_component
-            ).clamp_min(0.0)
-            mode_log_weight = (
-                -selected_cost_gap / self.goal_prob_match_temperature
-            )
-            mode_log_weight = mode_log_weight.masked_fill(
-                ~selected_valid, float('-inf')
-            )
-            mode_weight = mode_log_weight.softmax(dim=-1)
-
-        goal_probability = goal_probability.gather(
-            1,
-            selected_component[:, :, None].expand(-1, -1, A),
-        )
-        goal_anchor_position = goal_anchor_position.gather(
-            1,
-            selected_component[:, :, None, None].expand(
-                -1, -1, A, goal_anchor_position.size(-1)
-            ),
-        )
+        # Only the selected goal component receives distribution supervision.
+        goal_probability = goal_probability[b_idx, positive_goal_component]
+        goal_anchor_position = goal_anchor_position[b_idx, positive_goal_component]
 
         # Anisotropic path-tube likelihood: deviations across the GT path are
         # penalized more strongly than along-path progress (speed) errors.
@@ -541,44 +382,21 @@ class Criterion(nn.Module):
         prior = prior / prior.sum(dim=-1, keepdim=True)
         log_prior = prior.log()
         log_posterior = log_likelihood + log_prior
-        log_posterior = log_posterior - torch.logsumexp(
-            log_posterior, dim=-1, keepdim=True
-        )
+        log_posterior = log_posterior - torch.logsumexp(log_posterior, dim=-1, keepdim=True)
         posterior = log_posterior.exp()
 
-        nll_per_mode = ((-log_likelihood) * posterior).sum(dim=-1)
-        nll_per_sample = (nll_per_mode * mode_weight).sum(dim=-1)
+        nll_per_sample = ((-log_likelihood) * posterior).sum(dim=-1)
         nll = (nll_per_sample * valid_final).sum() / valid_count
 
-        entropy_per_mode = -(
-            posterior * log_posterior
-        ).sum(dim=-1)
-        entropy_per_sample = (
-            entropy_per_mode * mode_weight
-        ).sum(dim=-1)
-        posterior_entropy = (
-            entropy_per_sample * valid_final
-        ).sum() / valid_count
+        entropy_per_sample = -(posterior * log_posterior).sum(dim=-1)
+        posterior_entropy = (entropy_per_sample * valid_final).sum() / valid_count
 
-        kl_per_mode = (
-            posterior * (log_posterior - log_prior)
-        ).sum(dim=-1)
-        kl_per_sample = (kl_per_mode * mode_weight).sum(dim=-1)
+        kl_per_sample = (posterior * (log_posterior - log_prior)).sum(dim=-1)
         kl_loss = (kl_per_sample * valid_final).sum() / valid_count
 
-        return (
-            nll
-            + entropy_weight * posterior_entropy
-            + kl_weight * kl_loss
-        )
+        return nll + entropy_weight * posterior_entropy + kl_weight * kl_loss
 
-    def get_goal_fde_loss(
-        self,
-        predicted_goal_position,
-        goal_FDE,
-        gt,
-        center_gt_final_valid_idx,
-    ):
+    def get_goal_fde_loss(self, predicted_goal_position, goal_FDE, gt, center_gt_final_valid_idx):
         """
         predicted_goal_position: [B, K, 2], discrete argmax anchor coordinates
         goal_FDE: [B, K]
@@ -596,14 +414,10 @@ class Criterion(nn.Module):
         # FDE is a detached quality target: it trains the ranking head without
         # leaking gradients into the proposed goal coordinates.
         final_goal_position = predicted_goal_position.detach()
-        FDE_gt = torch.norm(
-            final_goal_position - gt_goal.unsqueeze(1), p=2, dim=-1
-        )
+        FDE_gt = torch.norm(final_goal_position - gt_goal.unsqueeze(1), p=2, dim=-1)
         valid_rows = valid_final.bool()
         if valid_rows.any():
-            disp_loss = self.goal_FDE_loss(
-                goal_FDE[valid_rows], FDE_gt[valid_rows]
-            )
+            disp_loss = self.goal_FDE_loss(goal_FDE[valid_rows], FDE_gt[valid_rows])
         else:
             disp_loss = goal_FDE.sum() * 0.0
 
@@ -626,29 +440,31 @@ class Criterion(nn.Module):
     def get_dense_future_prediction_loss(self, prediction, gt):
         obj_trajs_future_state = gt['obj_trajs_future_state']
         obj_trajs_future_mask = gt['obj_trajs_future_mask']
-        pred_dense_trajs = prediction # (num_center_objects, num_objects, num_future_frames, 7)
+        pred_dense_trajs = prediction  # (num_center_objects, num_objects, num_future_frames, 7)
         assert pred_dense_trajs.shape[-1] == 7
         assert obj_trajs_future_state.shape[-1] == 4
 
-        pred_dense_trajs_gmm, pred_dense_trajs_vel = pred_dense_trajs[:, :, :, 0:5], pred_dense_trajs[:, :, :, 5:7]
+        pred_dense_trajs_gmm = pred_dense_trajs[:, :, :, 0:5]
+        pred_dense_trajs_vel = pred_dense_trajs[:, :, :, 5:7]
 
         loss_reg_vel = F.l1_loss(pred_dense_trajs_vel, obj_trajs_future_state[:, :, :, 2:4], reduction='none')
         loss_reg_vel = (loss_reg_vel * obj_trajs_future_mask[:, :, :, None]).sum(dim=-1).sum(dim=-1)
 
         num_center_objects, num_objects, num_timestamps, _ = pred_dense_trajs.shape
-        fake_scores = pred_dense_trajs.new_zeros((num_center_objects, num_objects)).view(-1,
-                                                                                         1)  # (num_center_objects * num_objects, 1)
-
-        temp_pred_trajs = pred_dense_trajs_gmm.contiguous().view(num_center_objects * num_objects, 1, num_timestamps, 5)
-        temp_gt_idx = torch.zeros(num_center_objects * num_objects).long()  # (num_center_objects * num_objects)
-        temp_gt_trajs = obj_trajs_future_state[:, :, :, 0:2].contiguous().view(num_center_objects * num_objects,
-                                                                               num_timestamps, 2)
-        temp_gt_trajs_mask = obj_trajs_future_mask.view(num_center_objects * num_objects, num_timestamps)
+        total_objects = num_center_objects * num_objects
+        fake_scores = pred_dense_trajs.new_zeros(total_objects, 1)
+        temp_pred_trajs = pred_dense_trajs_gmm.contiguous().view(total_objects, 1, num_timestamps, 5)
+        temp_gt_idx = torch.zeros(total_objects).long()
+        temp_gt_trajs = obj_trajs_future_state[:, :, :, 0:2].contiguous().view(total_objects, num_timestamps, 2)
+        temp_gt_trajs_mask = obj_trajs_future_mask.view(total_objects, num_timestamps)
         loss_reg_gmm, _ = self.nll_loss_gmm_direct(
-            pred_scores=fake_scores, pred_trajs=temp_pred_trajs, gt_trajs=temp_gt_trajs,
+            pred_scores=fake_scores,
+            pred_trajs=temp_pred_trajs,
+            gt_trajs=temp_gt_trajs,
             gt_valid_mask=temp_gt_trajs_mask,
             pre_nearest_mode_idxs=temp_gt_idx,
-            timestamp_loss_weight=None, use_square_gmm=False,
+            timestamp_loss_weight=None,
+            use_square_gmm=False,
         )
         loss_reg_gmm = loss_reg_gmm.view(num_center_objects, num_objects)
 
@@ -656,15 +472,25 @@ class Criterion(nn.Module):
 
         obj_valid_mask = obj_trajs_future_mask.sum(dim=-1) > 0
 
-        loss_reg = (loss_reg * obj_valid_mask.float()).sum(dim=-1) / torch.clamp_min(obj_valid_mask.sum(dim=-1),
-                                                                                     min=1.0)
+        valid_objects = torch.clamp_min(obj_valid_mask.sum(dim=-1), min=1.0)
+        loss_reg = (loss_reg * obj_valid_mask.float()).sum(dim=-1) / valid_objects
         loss_reg = loss_reg.mean()
 
         w = float(self.config.get('dense_future_weight', 0.5))
         return w * loss_reg
     
-    def nll_loss_gmm_direct(self, pred_scores, pred_trajs, gt_trajs, gt_valid_mask, pre_nearest_mode_idxs=None,
-                            timestamp_loss_weight=None, use_square_gmm=False, log_std_range=(-1.609, 5.0), rho_limit=0.5):
+    def nll_loss_gmm_direct(
+        self,
+        pred_scores,
+        pred_trajs,
+        gt_trajs,
+        gt_valid_mask,
+        pre_nearest_mode_idxs=None,
+        timestamp_loss_weight=None,
+        use_square_gmm=False,
+        log_std_range=(-1.609, 5.0),
+        rho_limit=0.5,
+    ):
         """
         GMM Loss for Motion Transformer (MTR): https://arxiv.org/abs/2209.13508
         Written by Shaoshuai Shi 
@@ -715,8 +541,10 @@ class Criterion(nn.Module):
         # -log(a^-1 * e^b) = log(a) - b
         reg_gmm_log_coefficient = log_std1 + log_std2 + 0.5 * torch.log(1 - rho ** 2)  # (batch_size, num_timestamps)
         reg_gmm_exp = (0.5 * 1 / (1 - rho ** 2)) * (
-                (dx ** 2) / (std1 ** 2) + (dy ** 2) / (std2 ** 2) - 2 * rho * dx * dy / (
-                std1 * std2))  # (batch_size, num_timestamps)
+            (dx ** 2) / (std1 ** 2)
+            + (dy ** 2) / (std2 ** 2)
+            - 2 * rho * dx * dy / (std1 * std2)
+        )  # (batch_size, num_timestamps)
 
         reg_loss = ((reg_gmm_log_coefficient + reg_gmm_exp) * gt_valid_mask).sum(dim=-1)
 

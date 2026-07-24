@@ -17,37 +17,6 @@ from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to
 MODEL_DIR = Path(__file__).resolve().parent
 
 
-# Target-motion ablation: keep the previous conditioning implementation here so
-# it can be restored easily, but do not register or execute it in BDA_DEC.
-# class QueryConditionedDynamics(nn.Module):
-#     """
-#     dynamics: [batch_size, query_num, dyn_dim]
-#     query_emb: [batch_size, query_num, query_dim]
-#     FiLM: Feature-wise Linear Modulation
-#
-#     """
-#     def __init__(self, query_dim, hidden_dim):
-#         super().__init__()
-#
-#         self.modulator = nn.Sequential(
-#             nn.Linear(query_dim, hidden_dim),
-#             nn.GELU(),
-#             nn.Linear(hidden_dim, 2 * hidden_dim),
-#         )
-#
-#         # Initialize the last layer to produce zero modulation at the beginning
-#         nn.init.zeros_(self.modulator[-1].weight)
-#         nn.init.zeros_(self.modulator[-1].bias)
-#
-#
-#     def forward(self, dynamics, query_emb):
-#         B, N, _ = query_emb.shape
-#         gamma_beta = self.modulator(query_emb) #(B, N, 2 * hidden_dim)
-#         gamma, beta = gamma_beta.chunk (2, dim=-1) #(B, N, hidden_dim) each
-#         conditioned = (1 + gamma) * dynamics + beta #(B, N, hidden_dim)
-#         return conditioned
-
-
 class DeformAttn(nn.Module):
     def __init__(self, config, d_model, grid_size):
         super(DeformAttn, self).__init__()
