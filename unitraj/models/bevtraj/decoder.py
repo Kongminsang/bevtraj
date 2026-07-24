@@ -759,14 +759,13 @@ class BEVTrajDecoder(nn.Module):
         goal_probability = goal_logits.float().softmax(dim=-1)
         goal_anchor_position = bda_pos[:, self.goal_anchor_indices]
 
-        # Forward selection is exactly the argmax anchor. The soft component of
-        # this straight-through weight lets downstream trajectory losses update
-        # the new anchor scorer through the selected-token representation.
+        # Select the argmax anchor without a straight-through gradient.
+        # The anchor scorer is trained only through its explicit probability
+        # losses, while downstream losses still update the selected token.
         local_goal_idx = goal_probability.argmax(dim=-1)
-        hard_selection = F.one_hot(
+        selection_weight = F.one_hot(
             local_goal_idx, num_classes=goal_probability.size(-1)
         ).to(goal_probability.dtype)
-        selection_weight = hard_selection + goal_probability - goal_probability.detach()
         goal_position = goal_anchor_position.gather(
             dim=2,
             index=local_goal_idx[:, :, None, None].expand(-1, -1, 1, 2),
