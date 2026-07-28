@@ -192,6 +192,7 @@ class BEVTrajDecoder(nn.Module):
         self.goal_flow_hidden_dim = int(config.get('goal_flow_hidden_dim', max(self.D // 4, 32)))
         self.goal_flow_anchor_chunk_size = int(config.get('goal_flow_anchor_chunk_size', 64))
         self.goal_heading_chord_steps = int(config.get('goal_heading_chord_steps', 5))
+        self.goal_attn_temperature = config.get('goal_attn_temperature', 0.1)
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
@@ -736,19 +737,14 @@ class BEVTrajDecoder(nn.Module):
         goal_log_attn = bda_cross_attn.float().clamp_min(1e-12).log()
         flow_log_attn = flow_cross_attn.float().clamp_min(1e-12).log()
         goal_log_attn = torch.where(flow_has_anchor[..., None], goal_log_attn + flow_log_attn, goal_log_attn)
+        goal_log_attn = goal_log_attn / self.goal_attn_temperature
         goal_log_attn = goal_log_attn.masked_fill(safe_flow_mode_mask, float('-inf'))
-        dense_goal_probability = goal_log_attn.softmax(dim=-1)
-        cluster_indices = self.goal_anchor_indices[None].expand(B, -1, -1)
-        goal_probability = dense_goal_probability.gather(dim=-1, index=cluster_indices)
-        goal_anchor_position = bda_pos[:, self.goal_anchor_indices]
-        local_goal_idx = goal_probability.argmax(dim=-1)
-        goal_position = goal_anchor_position.gather(
-            dim=2,
-            index=local_goal_idx[:, :, None, None].expand(-1, -1, 1, 2),
-        ).squeeze(2).permute(1, 0, 2).contiguous()
+        normalized_attn = goal_log_attn.softmax(dim=-1)
+        goal_position = (bda_pos[:, None] * normalized_attn.unsqueeze(-1)).sum(dim=2)
+        goal_position = goal_position.permute(1, 0, 2).contiguous()
 
         goal_FDE = self.goal_FDE(bda_mode_query).squeeze(-1).T
-        return bda_mode_query, goal_position, goal_probability, goal_anchor_position, goal_FDE
+        return bda_mode_query, goal_position, goal_FDE
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
@@ -1058,13 +1054,7 @@ class BEVTrajDecoder(nn.Module):
         scene_context = scene_context.permute(1, 0, 2)
 
         # -------------------Goal Candidate Proposal -----------------
-        (
-            mode_query,
-            goal_position,
-            goal_probability,
-            goal_anchor_position,
-            goal_FDE,
-        ) = \
+        mode_query, goal_position, goal_FDE = \
             self.goal_candidate_proposal(
                 bev_feat,
                 ec_dyn,
@@ -1157,8 +1147,6 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
                   'predicted_goal_position': predicted_goal_position,
-                  'predicted_goal_probability': goal_probability,
-                  'goal_anchor_position': goal_anchor_position,
                   'predicted_goal_FDE': goal_FDE,
                 #   'init_top_idx': init_top_idx,                # [B, K]
                   'state_pred': state_pred, # [B, T, 2]
