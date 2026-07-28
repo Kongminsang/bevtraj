@@ -26,9 +26,62 @@ Please treat the current version as a **preview/research prototype** rather than
 
 🔥 BEVTraj is powered by [MMDetection3D](https://github.com/open-mmlab/mmdetection3d), [UniTraj](https://github.com/vita-epfl/UniTraj/tree/main), [Scenarionet](https://github.com/metadriverse/scenarionet) and [BEVFusion](https://github.com/mit-han-lab/bevfusion).
 
-Follow the steps below to set up the environment and install all dependencies for BEVTraj.
+BEVTraj provides a Docker environment with all required dependencies. If
+Docker is available, follow the Docker setup below and then proceed directly
+to **Data Preparation**. To install BEVTraj directly on the host, follow the
+manual installation steps instead.
 
-### 1. Create Conda Environment & Install PyTorch
+### 🐳 Docker
+
+#### Prerequisites
+
+- Docker Engine with the Compose plugin
+- An NVIDIA GPU and driver
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+
+The CUDA toolkit is included in the image and does not need to be installed on
+the host.
+
+#### Build
+
+```bash
+docker compose build
+```
+
+#### Verify
+
+```bash
+docker compose run --rm bevtraj \
+    python docker/verify_install.py --expect-gpus 1
+```
+
+Change `--expect-gpus` when a different minimum GPU count is required.
+
+#### Run
+
+Start the service and open a shell:
+
+```bash
+docker compose up -d
+docker compose exec bevtraj bash
+```
+
+Stop the service:
+
+```bash
+docker compose down
+```
+
+Use a temporary container for a one-off command:
+
+```bash
+docker compose run --rm bevtraj \
+    python unitraj/train.py method=bevtraj_nusc
+```
+
+### Manual Installation
+
+#### 1. Create Conda Environment & Install PyTorch
 
 ```bash
 conda create -n bevtraj python=3.9
@@ -37,7 +90,8 @@ conda activate bevtraj
 # Install PyTorch (adjust CUDA version as needed)
 pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu116
 ```
-### 2. mmdetection3d Setup
+
+#### 2. mmdetection3d Setup
 
 Follow the official instructions from [mmdetection3d documentation](https://mmdetection3d.readthedocs.io/en/latest/get_started.html):
 
@@ -72,7 +126,7 @@ cp mmdetection3d/projects/BEVFusion/bevfusion/ops/voxel/voxel_layer.*.so
 bevtraj/unitraj/models/bevtraj/bevfusion/ops/voxel/
 ```
 
-### 3. Scenarionet Setup
+#### 3. Scenarionet Setup
 
 Follow the official instructions from [Scenarionet](https://scenarionet.readthedocs.io/en/latest/install.html)
 
@@ -86,7 +140,7 @@ cd scenarionet
 pip install -e .
 ```
 
-### 4. BEVTraj Setup
+#### 4. BEVTraj Setup
 
 ```bash
 cd ~/bevtraj

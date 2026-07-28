@@ -1,0 +1,37 @@
+services:
+  bevtraj:
+    image: bevtraj:cu118
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MAX_JOBS: ${MAX_JOBS:-8}
+    working_dir: /opt/bevtraj
+    stdin_open: true
+    tty: true
+    ipc: host
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
+      WANDB_DIR: /opt/bevtraj/wandb
+      WANDB_MODE: ${WANDB_MODE:-offline}
+      WANDB_API_KEY: ${WANDB_API_KEY:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - ./data:/opt/bevtraj/data
+      - ./pretraining_ckpt:/opt/bevtraj/pretraining_ckpt
+      - ./ckpt:/opt/bevtraj/ckpt
+      - ./outputs:/opt/bevtraj/outputs
+      - ./lightning_logs:/opt/bevtraj/lightning_logs
+      - ./wandb:/opt/bevtraj/wandb
