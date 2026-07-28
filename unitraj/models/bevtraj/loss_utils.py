@@ -67,7 +67,10 @@ class Criterion(nn.Module):
         gt_dense_future_trajs = gt[1]
 
         positive_goal_component = self.get_positive_goal_component(
-            predicted_goal_position, gt_decoder, center_gt_final_valid_idx
+            goal_probability=goal_probability,
+            goal_anchor_position=goal_anchor_position,
+            gt=gt_decoder,
+            center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
         
         decoder_loss = self.get_decoder_loss_hard_assign(
@@ -324,17 +327,30 @@ class Criterion(nn.Module):
 
         return cost.reshape(B, *original_shape)
 
-    def get_positive_goal_component(self, predicted_goal_position, gt, center_gt_final_valid_idx):
-        """Match the discrete predicted goal closest to the GT endpoint."""
-        B, K, coordinate_dim = predicted_goal_position.shape
-        assert coordinate_dim == 2
-        assert gt.size(0) == B
+    def get_positive_goal_component(
+        self,
+        goal_probability,
+        goal_anchor_position,
+        gt,
+        center_gt_final_valid_idx,
+    ):
+        """Hard-assign each sample using the weighted goal's GT-path cost."""
+        B, K, A = goal_probability.shape
+        assert goal_anchor_position.shape == (B, K, A, 2)
 
         with torch.no_grad():
-            b_idx = torch.arange(B, device=gt.device)
-            gt_goal = gt[b_idx, center_gt_final_valid_idx.long(), :2].to(predicted_goal_position.dtype)
-            goal_distance = (predicted_goal_position.detach() - gt_goal[:, None]).norm(dim=-1)
-            positive_goal_component = goal_distance.argmin(dim=-1)
+            weighted_goal_position = (
+                goal_probability.detach().unsqueeze(-1)
+                * goal_anchor_position.detach()
+            ).sum(dim=2)
+            goal_path_cost = self._get_goal_path_cost(
+                goal_position=weighted_goal_position,
+                gt=gt,
+                center_gt_final_valid_idx=center_gt_final_valid_idx,
+                lateral_sigma=self.goal_prob_lateral_sigma,
+                progress_sigma=self.goal_prob_progress_sigma,
+            )
+            positive_goal_component = goal_path_cost.argmin(dim=-1)
 
         return positive_goal_component
 

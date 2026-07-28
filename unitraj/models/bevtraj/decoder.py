@@ -299,27 +299,14 @@ class BEVTrajDecoder(nn.Module):
             }
             self.goal_proposal.append(nn.ModuleDict(goal_layer))
 
-        # Cross-attention builds mode context; a separate mode-conditioned head
-        # predicts the endpoint-anchor distribution.
-        self.goal_bda_conditioner = QueryConditionedDynamics(self.D, self.D)
-        self.goal_bda_score_proj = MLP(self.D, self.D, self.goal_score_hidden_dim, 2)
-        self.goal_flow_conditioner = QueryConditionedDynamics(self.D, self.D)
-        self.goal_flow_score_proj = MLP(self.D, self.D, self.goal_score_hidden_dim, 2)
-        self.goal_score_fusion = MLP(2 * self.goal_score_hidden_dim, self.goal_score_hidden_dim, 1, 2)
         self.goal_motion_encoder = MLP(self.target_attr, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
         self.goal_motion_time_encoder = MLP(1, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
         self.goal_motion_attn = nn.MultiheadAttention(self.goal_score_hidden_dim, 4, dropout=0.0, batch_first=True)
         self.goal_motion_pool = MLP(2 * self.goal_score_hidden_dim, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
-        self.goal_motion_score = MLP(self.D + self.goal_score_hidden_dim, self.goal_score_hidden_dim, 1, 3)
-        nn.init.zeros_(self.goal_motion_score.layers[-1].weight)
-        nn.init.zeros_(self.goal_motion_score.layers[-1].bias)
+        self.goal_motion_conditioner = QueryConditionedDynamics(self.goal_score_hidden_dim, self.D)
         history_time = (torch.arange(self.t, dtype=torch.float32) - self.t + 1) * float(config.get('dt', 0.1))
         self.register_buffer('goal_history_time', history_time.unsqueeze(-1), persistent=False)
 
-        # The selected anchor evidence is fused back into the downstream mode
-        # representation so the hard goal and mode semantics stay aligned.
-        self.goal_selected_mode_fusion = MLP(4 * self.D, self.D, self.D, 2)
-        self.goal_selected_mode_norm = nn.LayerNorm(self.D)
         self.goal_FDE = MLP(self.D, self.D, 1, 2)
 
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
@@ -674,18 +661,12 @@ class BEVTrajDecoder(nn.Module):
         agent_history,
         target_idx,
     ):
-        # ====================== BDA anchor-token encoding ======================
         bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
         B = bda_token.size(0)
-
-        # Anchor-local traffic flow remains a separate token stream. Each dense
-        # anchor uses the precomputed arrival heading as its local +x direction.
         goal_flow_token, goal_flow_presence = self.build_goal_anchor_flow_tokens(
             agent_history, target_idx, output_dtype=bda_token.dtype
         )
 
-        # Add the anchor position to each modality independently. This preserves
-        # exact anchor identity without concatenating BDA and flow information.
         bda_pos_embed = gen_sineembed_for_position(
             bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
         ).to(dtype=bda_token.dtype)
@@ -694,31 +675,39 @@ class BEVTrajDecoder(nn.Module):
         flow_key = (goal_flow_token + bda_pos_embed).permute(1, 0, 2)
         flow_value = goal_flow_token.permute(1, 0, 2)
 
-        # ============== Independent cluster-restricted refinement =============
-        bda_mode_query = self.goal_bda_query.expand(-1, B, -1)
-        flow_mode_query = self.goal_flow_query.expand(-1, B, -1)
+        motion_tokens = self.goal_motion_encoder(tc_dyn)
+        motion_time_pe = self.goal_motion_time_encoder(self.goal_history_time.to(motion_tokens.dtype))[None]
+        target_idx = target_idx.to(device=motion_tokens.device, dtype=torch.long)
+        target_valid_mask = agent_history['valid_mask'][torch.arange(B, device=motion_tokens.device), target_idx].bool()
+        attended_motion = self.goal_motion_attn(
+            motion_tokens[:, -1:] + motion_time_pe[:, -1:],
+            motion_tokens + motion_time_pe,
+            motion_tokens,
+            key_padding_mask=~target_valid_mask,
+            need_weights=False,
+        )[0][:, 0]
+        motion_context = self.goal_motion_pool(torch.cat([motion_tokens[:, -1], attended_motion], dim=-1))[None]
+        bda_mode_query = self.goal_motion_conditioner(self.goal_bda_query.expand(-1, B, -1), motion_context)
+        flow_mode_query = self.goal_motion_conditioner(self.goal_flow_query.expand(-1, B, -1), motion_context)
 
-        # Exclude empty flow anchors. Fully empty mode rows use a safe mask and
-        # are zeroed after attention to avoid all-masked softmax NaNs.
         flow_anchor_valid = goal_flow_presence.squeeze(-1)
         flow_attn_mask = self.goal_attn_mask[None] | ~flow_anchor_valid[:, None]
         flow_has_anchor = ~flow_attn_mask.all(dim=-1)
-        safe_flow_attn_mask = torch.where(
+        safe_flow_mode_mask = torch.where(
             flow_has_anchor[..., None], flow_attn_mask, self.goal_attn_mask[None]
         )
-        safe_flow_attn_mask = safe_flow_attn_mask[:, None].expand(-1, self.num_heads, -1, -1)
-        safe_flow_attn_mask = safe_flow_attn_mask.reshape(
-            B * self.num_heads, self.K, bda_token.size(1)
-        )
+        safe_flow_attn_mask = safe_flow_mode_mask[:, None].expand(-1, self.num_heads, -1, -1)
+        safe_flow_attn_mask = safe_flow_attn_mask.reshape(B * self.num_heads, self.K, bda_token.size(1))
 
-        for layer in self.goal_proposal:
-            bda_cross_out = layer['bda_cross_attn'](
+        for layer_idx, layer in enumerate(self.goal_proposal):
+            is_last_layer = layer_idx == len(self.goal_proposal) - 1
+            bda_cross_out, bda_cross_attn = layer['bda_cross_attn'](
                 query=bda_mode_query,
                 key=bda_key,
                 value=bda_value,
                 attn_mask=self.goal_attn_mask,
-                need_weights=False,
-            )[0]
+                need_weights=is_last_layer,
+            )
             bda_mode_query = layer['bda_cross_norm'](bda_mode_query + bda_cross_out)
             bda_self_out = layer['bda_self_attn'](
                 bda_mode_query, bda_mode_query, bda_mode_query,
@@ -727,99 +716,39 @@ class BEVTrajDecoder(nn.Module):
             bda_mode_query = layer['bda_self_norm'](bda_mode_query + bda_self_out)
             bda_mode_query = layer['bda_ffn_norm'](layer['bda_ffn'](bda_mode_query))
 
-            flow_cross_out = layer['flow_cross_attn'](
+            flow_cross_out, flow_cross_attn = layer['flow_cross_attn'](
                 query=flow_mode_query,
                 key=flow_key,
                 value=flow_value,
                 attn_mask=safe_flow_attn_mask,
-                need_weights=False,
-            )[0]
+                need_weights=is_last_layer,
+            )
             flow_cross_out = flow_cross_out * flow_has_anchor.T[..., None].to(flow_cross_out.dtype)
-            flow_mode_query = layer['flow_cross_norm'](flow_mode_query + flow_cross_out)
-            flow_self_out = layer['flow_self_attn'](
-                flow_mode_query, flow_mode_query, flow_mode_query,
-                need_weights=False,
-            )[0]
-            flow_mode_query = layer['flow_self_norm'](flow_mode_query + flow_self_out)
-            flow_mode_query = layer['flow_ffn_norm'](layer['flow_ffn'](flow_mode_query))
+            if not is_last_layer:
+                flow_mode_query = layer['flow_cross_norm'](flow_mode_query + flow_cross_out)
+                flow_self_out = layer['flow_self_attn'](
+                    flow_mode_query, flow_mode_query, flow_mode_query,
+                    need_weights=False,
+                )[0]
+                flow_mode_query = layer['flow_self_norm'](flow_mode_query + flow_self_out)
+                flow_mode_query = layer['flow_ffn_norm'](layer['flow_ffn'](flow_mode_query))
 
-        # =================== Goal aggregation and output heads =================
-        # Gather each mode's cluster before conditioning so scoring does not
-        # materialize every mode against the full dense anchor bank.
-        bda_mode_query_bk = bda_mode_query.permute(1, 0, 2)
-        cluster_bda_token = bda_token[:, self.goal_anchor_indices]
-        conditioned_bda_token = self.goal_bda_conditioner(
-            cluster_bda_token, bda_mode_query_bk[:, :, None]
-        )
-        score_features = [self.goal_bda_score_proj(conditioned_bda_token)]
-
-        flow_mode_query_bk = flow_mode_query.permute(1, 0, 2)
-        cluster_flow_presence = goal_flow_presence[:, self.goal_anchor_indices]
-        cluster_flow_token = goal_flow_token[:, self.goal_anchor_indices]
-        conditioned_flow_token = self.goal_flow_conditioner(
-            cluster_flow_token, flow_mode_query_bk[:, :, None]
-        )
-        flow_presence = cluster_flow_presence.to(conditioned_flow_token.dtype)
-        conditioned_flow_token = conditioned_flow_token * flow_presence
-        flow_score_feature = self.goal_flow_score_proj(conditioned_flow_token)
-        score_features.append(flow_score_feature * flow_presence)
-
+        goal_log_attn = bda_cross_attn.float().clamp_min(1e-12).log()
+        flow_log_attn = flow_cross_attn.float().clamp_min(1e-12).log()
+        goal_log_attn = torch.where(flow_has_anchor[..., None], goal_log_attn + flow_log_attn, goal_log_attn)
+        goal_log_attn = goal_log_attn.masked_fill(safe_flow_mode_mask, float('-inf'))
+        dense_goal_probability = goal_log_attn.softmax(dim=-1)
+        cluster_indices = self.goal_anchor_indices[None].expand(B, -1, -1)
+        goal_probability = dense_goal_probability.gather(dim=-1, index=cluster_indices)
         goal_anchor_position = bda_pos[:, self.goal_anchor_indices]
-        motion_tokens = self.goal_motion_encoder(tc_dyn)
-        motion_time_pe = self.goal_motion_time_encoder(self.goal_history_time.to(motion_tokens.dtype))[None].expand(B, -1, -1)
-        target_valid_mask = agent_history['valid_mask'][torch.arange(B, device=target_idx.device), target_idx]
-        attended_motion = self.goal_motion_attn(
-            motion_tokens[:, -1:] + motion_time_pe[:, -1:],
-            motion_tokens + motion_time_pe,
-            motion_tokens,
-            key_padding_mask=~target_valid_mask,
-            need_weights=False,
-        )[0][:, 0]
-        motion_context = self.goal_motion_pool(torch.cat([motion_tokens[:, -1], attended_motion], dim=-1))
-        motion_context = motion_context[:, None, None].expand(-1, self.K, goal_anchor_position.size(2), -1)
-        motion_logits = self.goal_motion_score(
-            torch.cat([bda_pos_embed[:, self.goal_anchor_indices], motion_context], dim=-1)
-        ).squeeze(-1)
-        scene_goal_logits = self.goal_score_fusion(torch.cat(score_features, dim=-1)).squeeze(-1)
-        goal_logits = scene_goal_logits + motion_logits
-        goal_probability = goal_logits.float().softmax(dim=-1)
-
-        # Select the argmax anchor without a straight-through gradient.
-        # The anchor scorer is trained only through its explicit probability
-        # losses, while downstream losses still update the selected token.
         local_goal_idx = goal_probability.argmax(dim=-1)
-        selection_weight = F.one_hot(
-            local_goal_idx, num_classes=goal_probability.size(-1)
-        ).to(goal_probability.dtype)
         goal_position = goal_anchor_position.gather(
             dim=2,
             index=local_goal_idx[:, :, None, None].expand(-1, -1, 1, 2),
         ).squeeze(2).permute(1, 0, 2).contiguous()
 
-        selected_bda_token = (
-            selection_weight.to(conditioned_bda_token.dtype).unsqueeze(-1)
-            * conditioned_bda_token
-        ).sum(dim=2)
-        selected_mode_features = [bda_mode_query_bk, selected_bda_token]
-
-        # Use flow in the downstream query only when the selected anchor has flow.
-        flow_selection_weight = selection_weight.to(conditioned_flow_token.dtype)
-        selected_flow_gate = (flow_selection_weight.unsqueeze(-1) * flow_presence).sum(dim=2)
-        selected_flow_token = (
-            flow_selection_weight.unsqueeze(-1) * conditioned_flow_token
-        ).sum(dim=2)
-        gated_flow_mode_query = flow_mode_query_bk * selected_flow_gate
-        gated_selected_flow_token = selected_flow_token * selected_flow_gate
-        selected_mode_features.extend([gated_flow_mode_query, gated_selected_flow_token])
-
-        selected_mode_delta = self.goal_selected_mode_fusion(
-            torch.cat(selected_mode_features, dim=-1)
-        )
-        mode_query = self.goal_selected_mode_norm(bda_mode_query_bk + selected_mode_delta)
-        mode_query = mode_query.permute(1, 0, 2).contiguous()
-
-        goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
-        return mode_query, goal_position, goal_probability, goal_anchor_position, goal_FDE
+        goal_FDE = self.goal_FDE(bda_mode_query).squeeze(-1).T
+        return bda_mode_query, goal_position, goal_probability, goal_anchor_position, goal_FDE
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
