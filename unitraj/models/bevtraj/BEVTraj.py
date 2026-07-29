@@ -209,16 +209,9 @@ class BEVTraj(BaseModel):
             'ego_cos': agents_in[B_idx, ego_idx, -1, -5:-4], # (B, 1)
         }
 
-        # Agent states are already expressed in the current target-agent frame
-        # by the dataset. The decoder re-centers/rotates the current state once
-        # per candidate goal pose to encode local traffic flow and heading.
+        # Agent positions are already expressed in the target-agent frame.
         agent_history = {
             'positions': traj_data['obj_trajs_pos'][..., :2],  # (B, N, t, 2)
-            'heading': agents_in[..., -6:-4],  # (sin, cos), (B, N, t, 2)
-            'velocity': agents_in[..., -4:-2],  # (B, N, t, 2)
-            'acceleration': agents_in[..., -2:],  # (B, N, t, 2)
-            'size': agents_in[..., 3:6],  # (length, width, height)
-            'type': agents_in[..., 6:9],  # vehicle/pedestrian/cyclist
             'valid_mask': traj_data['obj_trajs_mask'].bool(),  # (B, N, t)
         }
         
