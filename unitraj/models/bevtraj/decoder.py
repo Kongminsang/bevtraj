@@ -269,7 +269,6 @@ class BEVTrajDecoder(nn.Module):
 
         # ============================ Initial Prediction ==============================
         self.trajectory_file_name = config['trajectory_file_name']
-        self.num_waypoints = config['num_waypoints']
         file_path = MODEL_DIR / self.trajectory_file_name
         with open(file_path, 'rb') as f:
             trajectory_set = pickle.load(f)['VEHICLE']
@@ -686,21 +685,17 @@ class BEVTrajDecoder(nn.Module):
         trajectory_idx = endpoint_distance.argmin(dim=-1)
         ref_trajectory = self.trajectory_set[trajectory_idx]  # [B, M, L, 2]
 
-        # BEV references use the ego frame.
-        steps_per_waypoint = self.T // self.num_waypoints
-        ref_waypoints = ref_trajectory[:, :, steps_per_waypoint - 1::steps_per_waypoint]
-        ref_waypoints = target_to_ego(
-            ref_waypoints.reshape(B, M * self.num_waypoints, 2),
+        # Use every future trajectory point as a BEV reference in the ego frame.
+        ref_points = target_to_ego(
+            ref_trajectory.reshape(B, M * self.T, 2),
             trans_x,
             trans_y,
             rot_sin,
             rot_cos,
-        ).reshape(B, M, self.num_waypoints, 2).permute(1, 0, 2, 3)
+        ).reshape(B, M, self.T, 2).permute(1, 0, 2, 3)
 
         # Temporal information is supplied by the per-timestep state query below.
-        mode_embed = mode_embed.unsqueeze(2).expand(
-            -1, -1, self.num_waypoints, -1
-        )
+        mode_embed = mode_embed.unsqueeze(2).expand(-1, -1, self.T, -1)
         query_scale = self.get_query_scale_itp(mode_embed)
 
         mode_embed = self.norm_l1[1](
@@ -708,10 +703,10 @@ class BEVTrajDecoder(nn.Module):
                 dec_embed=mode_embed,
                 bev_feat=bev_feat,
                 query_scale=query_scale,
-                ref_points=ref_waypoints,
+                ref_points=ref_points,
             )
         )
-        mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))  # [M,B,12,D]
+        mode_embed = self.norm_l1[2](self.ffn_l1(mode_embed))  # [M,B,T,D]
 
         # ===================== state consistency branch =====================
         t = (self.future_time * self.dt + 0.1).to(
@@ -734,14 +729,7 @@ class BEVTrajDecoder(nn.Module):
         state_pred = self.state_reg_l1(state_query).permute(1, 0, 2).contiguous()
 
         # ===================== hybrid coupling =====================
-        mode_bt = mode_embed.permute(1, 0, 2, 3).unsqueeze(3)
-        state_bt = state_query.permute(1, 0, 2).reshape(
-            B, 1, self.num_waypoints, steps_per_waypoint, self.D
-        )
-
-        dec_embed_T = mode_bt + state_bt  # [B,M,12,5,D]
-        dec_embed_T = dec_embed_T.reshape(B, M, self.T, self.D)
-        dec_embed_T = dec_embed_T.permute(1, 0, 2, 3).contiguous()
+        dec_embed_T = mode_embed + state_query.permute(1, 0, 2).unsqueeze(0)
 
         # ===================== trajectory prediction =====================
         out_dist = self.motion_reg_l1(dec_embed_T)  # [M,B,T,5]

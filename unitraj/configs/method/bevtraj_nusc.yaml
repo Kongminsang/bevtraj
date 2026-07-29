@@ -220,7 +220,6 @@ MODEL:
         refinement_smoothing_alpha: 0.6
         goal_anchor_file_name: 'cluster_10mode_96anchors_6s_v2.pkl'
         trajectory_file_name: 'trajectory_set_64_60.pkl'
-        num_waypoints: 12
 
         bda_dec:
             past_len: *past_len
