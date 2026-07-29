@@ -697,15 +697,10 @@ class BEVTrajDecoder(nn.Module):
             rot_cos,
         ).reshape(B, M, self.num_waypoints, 2).permute(1, 0, 2, 3)
 
-        # Identify waypoint queries with the time PE at the end of each temporal
-        # block (with the default 12 waypoints: 0.5s, ..., 6.0s).
-        waypoint_time_pe = self.build_time_pe(B, M, mode_embed.dtype)[
-            steps_per_waypoint - 1::steps_per_waypoint
-        ]
-        waypoint_time_pe = waypoint_time_pe.reshape(
-            self.num_waypoints, B, M, self.D
-        ).permute(2, 1, 0, 3)
-        mode_embed = mode_embed.unsqueeze(2) + waypoint_time_pe
+        # Temporal information is supplied by the per-timestep state query below.
+        mode_embed = mode_embed.unsqueeze(2).expand(
+            -1, -1, self.num_waypoints, -1
+        )
         query_scale = self.get_query_scale_itp(mode_embed)
 
         mode_embed = self.norm_l1[1](
