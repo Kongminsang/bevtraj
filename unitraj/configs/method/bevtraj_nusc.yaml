@@ -214,10 +214,6 @@ MODEL:
         num_heads: 16
         score_time_stride_late_layers: 4
         score_time_full_refine_layers: 1
-        # Fixed Gaussian smoothing for iterative XY refinement offsets
-        refinement_smoothing_kernel_size: 7
-        refinement_smoothing_sigma: 1.5  # timesteps
-        refinement_smoothing_alpha: 0.6
         goal_anchor_file_name: 'cluster_10mode_96anchors_6s_v2.pkl'
         trajectory_file_name: 'trajectory_set_64_60.pkl'
 
