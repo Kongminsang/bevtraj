@@ -83,7 +83,11 @@ class BEVTraj(BaseModel):
         self.scene_context_encoder = BEVTrajSceneContextEncoder(
                         self.config['SCENE_CONTEXT_ENCODER'], config['PRE_ENCODER']['d_model'], bev_feat_dim)
         self.decoder = BEVTrajDecoder(self.config['DECODER'])
-        self.criterion = Criterion(self.config['loss'])
+        self.criterion = Criterion(
+            self.config['loss'],
+            self.decoder.goal_cluster_anchors,
+            self.decoder.goal_cluster_centroids,
+        )
         
         self.bev_feat_down = nn.Sequential(
                 nn.Conv2d(bev_feat_dim, dec_dim, kernel_size=1),

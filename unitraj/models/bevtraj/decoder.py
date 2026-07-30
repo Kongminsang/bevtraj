@@ -222,10 +222,14 @@ class BEVTrajDecoder(nn.Module):
         with open(file_path, 'rb') as f:
             goal_anchor_data = pickle.load(f)['VEHICLE']
         goal_anchor_indices = torch.as_tensor(goal_anchor_data['anchor_indices'], dtype=torch.long)
+        goal_cluster_anchors = torch.as_tensor(goal_anchor_data['mode_anchors'], dtype=torch.float32)
+        goal_cluster_centroids = torch.as_tensor(goal_anchor_data['centroids'], dtype=torch.float32)
         goal_attn_mask = torch.ones(self.K, self.bda_sgcp.anchors.size(0), dtype=torch.bool)
         goal_attn_mask.scatter_(1, goal_anchor_indices, False)
         self.register_buffer('goal_attn_mask', goal_attn_mask, persistent=False)
         self.register_buffer('goal_anchor_indices', goal_anchor_indices, persistent=False)
+        self.register_buffer('goal_cluster_anchors', goal_cluster_anchors, persistent=False)
+        self.register_buffer('goal_cluster_centroids', goal_cluster_centroids, persistent=False)
 
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
@@ -384,10 +388,9 @@ class BEVTrajDecoder(nn.Module):
 
         history_pos = agent_history['positions'].float()
         history_valid = agent_history['valid_mask'].bool()
-        cluster_anchors = self.bda_sgcp.anchors[self.goal_anchor_indices].float()
         threshold_sq = self.goal_agent_distance_threshold ** 2
         agents_in_mode = []
-        for mode_anchors in cluster_anchors:
+        for mode_anchors in self.goal_cluster_anchors:
             distance_sq = (history_pos.unsqueeze(-2) - mode_anchors).square().sum(dim=-1)
             agents_in_mode.append(((distance_sq.amin(dim=-1) <= threshold_sq) & history_valid).any(dim=-1))
         agents_in_mode = torch.stack(agents_in_mode, dim=1)
