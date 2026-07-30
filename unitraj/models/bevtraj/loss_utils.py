@@ -185,7 +185,6 @@ class Criterion(nn.Module):
             else:
                 # use previous anchor trajectories
                 anchor_trajs = preds[positive_layer_idx].permute(2, 0, 1, 3).detach()  # [B, K, T, 5]
-                dist = ((gt_xy[:, None] - anchor_trajs[..., :2]).norm(dim=-1) * gt_mask[:, None]).sum(dim=-1)
 
             # ---------- Distinct Anchors ----------
             select_mask = torch.ones_like(pred_scores, dtype=torch.bool)
@@ -213,12 +212,11 @@ class Criterion(nn.Module):
                     return_mask=True,
                 )
 
+            positive_mask = positive_goal_weights[:, :pred_scores.size(1)] > 0
+            select_mask = select_mask | positive_mask
+
             if positive_layer_idx < 0:
                 layer_positive_weights = positive_goal_weights[:, :pred_scores.size(1)]
-                positive_mask = layer_positive_weights > 0
-                select_mask = select_mask | positive_mask
-            else:
-                hard_idx = dist.masked_fill(~select_mask, 1e10).argmin(dim=-1)
 
             # MTR nll_loss_gmm_direct expects log_std, but MotionRegHead outputs sigma
             mu = pred_trajs[..., :2]
@@ -226,47 +224,28 @@ class Criterion(nn.Module):
             rho = pred_trajs[..., 4:5]
             pred_trajs_gmm = torch.cat([mu, log_std, rho], dim=-1)
 
-            if positive_layer_idx < 0:
-                loss_reg_gmm = self.nll_loss_gmm_soft_assign(
-                    pred_trajs=pred_trajs_gmm,
-                    gt_trajs=gt_xy,
-                    gt_valid_mask=gt_mask,
-                    mode_weights=layer_positive_weights,
-                )
+            if positive_layer_idx >= 0:
+                dist = ((gt_xy[:, None] - mu.detach()).norm(dim=-1) * gt_mask[:, None]).sum(dim=-1)
+                logits = -dist / self.goal_positive_temperature
+                layer_positive_weights = logits.masked_fill(~positive_mask, float('-inf')).softmax(dim=-1)
 
-                gt_vel_expanded = gt_vel[:, None].expand_as(pred_vel)
-                loss_reg_vel = F.l1_loss(pred_vel, gt_vel_expanded, reduction='none')
-                loss_reg_vel = (loss_reg_vel * gt_mask[:, None, :, None]).sum(dim=-1).sum(dim=-1)
-                loss_reg_vel = (loss_reg_vel * layer_positive_weights).sum(dim=-1)
-                loss_acc, loss_jerk, loss_curvature = self.get_trajectory_smoothness_loss(
-                    mu, gt_mask, layer_positive_weights
-                )
-
-                bce_target = positive_mask.float()
-                loss_cls = F.binary_cross_entropy_with_logits(pred_scores, bce_target, reduction='none')
-                bce_weight = torch.where(positive_mask, layer_positive_weights, torch.ones_like(pred_scores))
-                loss_cls = (loss_cls * bce_weight * select_mask.float()).sum(dim=-1)
-            else:
-                loss_reg_gmm, hard_idx = self.nll_loss_gmm_direct(
-                    pred_scores=pred_scores,
-                    pred_trajs=pred_trajs_gmm,
-                    gt_trajs=gt_xy,
-                    gt_valid_mask=gt_mask,
-                    pre_nearest_mode_idxs=hard_idx,
-                    timestamp_loss_weight=None,
-                    use_square_gmm=False,
-                )
-
-                pred_xy_pos = mu[b_idx, hard_idx]
-                pred_vel_pos = pred_vel[b_idx, hard_idx]
-                loss_reg_vel = F.l1_loss(pred_vel_pos, gt_vel, reduction='none')
-                loss_reg_vel = (loss_reg_vel * gt_mask[:, :, None]).sum(dim=-1).sum(dim=-1)
-                loss_acc, loss_jerk, loss_curvature = self.get_trajectory_smoothness_loss(pred_xy_pos, gt_mask)
-
-                bce_target = torch.zeros_like(pred_scores)
-                bce_target[b_idx, hard_idx] = 1.0
-                loss_cls = F.binary_cross_entropy_with_logits(pred_scores, bce_target, reduction='none')
-                loss_cls = (loss_cls * select_mask.float()).sum(dim=-1)
+            loss_reg_gmm = self.nll_loss_gmm_soft_assign(
+                pred_trajs=pred_trajs_gmm,
+                gt_trajs=gt_xy,
+                gt_valid_mask=gt_mask,
+                mode_weights=layer_positive_weights,
+            )
+            gt_vel_expanded = gt_vel[:, None].expand_as(pred_vel)
+            loss_reg_vel = F.l1_loss(pred_vel, gt_vel_expanded, reduction='none')
+            loss_reg_vel = (loss_reg_vel * gt_mask[:, None, :, None]).sum(dim=-1).sum(dim=-1)
+            loss_reg_vel = (loss_reg_vel * layer_positive_weights).sum(dim=-1)
+            loss_acc, loss_jerk, loss_curvature = self.get_trajectory_smoothness_loss(
+                mu, gt_mask, layer_positive_weights
+            )
+            bce_target = positive_mask.float()
+            loss_cls = F.binary_cross_entropy_with_logits(pred_scores, bce_target, reduction='none')
+            bce_weight = torch.where(positive_mask, layer_positive_weights, torch.ones_like(pred_scores))
+            loss_cls = (loss_cls * bce_weight * select_mask.float()).sum(dim=-1)
 
             layer_loss = w_reg * loss_reg_gmm + w_vel * loss_reg_vel + w_cls * loss_cls
             layer_loss = (layer_loss * valid_final).sum() / valid_final.sum().clamp_min(1.0)
