@@ -77,6 +77,7 @@ class Criterion(nn.Module):
             preds=preds,
             pred_vels=pred_vels,
             predicted_goal_position=predicted_goal_position,
+            positive_goal_component=positive_goal_component,
             gt_decoder=gt_decoder,
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
@@ -110,6 +111,7 @@ class Criterion(nn.Module):
         preds,                       # list of [K, T, B, 5]
         pred_vels,                   # list of [K, T, B, 2]
         predicted_goal_position,     # [B, K, 2]
+        positive_goal_component,     # [B]
         gt_decoder,                  # [B, T, 5] -> (x, y, vx, vy, valid)
         center_gt_final_valid_idx,   # [B]
     ):
@@ -121,7 +123,6 @@ class Criterion(nn.Module):
         gt_vel = gt_decoder[..., 2:4]                   # [B, T, 2]
         gt_mask = gt_decoder[..., 4].float()            # [B, T]
         final_idx = center_gt_final_valid_idx.long()    # [B]
-        gt_goal = gt_xy[b_idx, final_idx]               # [B, 2]
         valid_final = gt_mask[b_idx, final_idx]         # [B]
 
         w_cls = self.config.get('cls_weight', 2.0)
@@ -147,11 +148,8 @@ class Criterion(nn.Module):
             # ---------- Evolving Anchors ----------
             positive_layer_idx = (layer_idx // num_inter_layers) * num_inter_layers - 1
             if positive_layer_idx < 0:
-                # first-stage anchor from SGCP anchors
                 cur_goal_position = predicted_goal_position[:, :pred_scores.size(1)]
-
                 anchor_trajs = cur_goal_position.detach().unsqueeze(2)
-                dist = (cur_goal_position.detach() - gt_goal[:, None, :]).norm(dim=-1)
             else:
                 # use previous anchor trajectories
                 anchor_trajs = preds[positive_layer_idx].permute(2, 0, 1, 3).detach()  # [B, K, T, 5]
@@ -184,8 +182,11 @@ class Criterion(nn.Module):
                 )
 
             # Evolving + Distinct
-            dist = dist.masked_fill(~select_mask, 1e10)
-            hard_idx = dist.argmin(dim=-1)
+            if positive_layer_idx < 0:
+                hard_idx = positive_goal_component
+                select_mask[b_idx, hard_idx] = True
+            else:
+                hard_idx = dist.masked_fill(~select_mask, 1e10).argmin(dim=-1)
 
             # MTR nll_loss_gmm_direct expects log_std, but MotionRegHead outputs sigma
             mu = pred_trajs[..., :2]
