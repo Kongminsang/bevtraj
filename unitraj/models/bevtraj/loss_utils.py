@@ -66,11 +66,9 @@ class Criterion(nn.Module):
         gt_decoder = gt[0]
         gt_dense_future_trajs = gt[1]
 
-        positive_goal_component = self.get_positive_goal_component(
-            predicted_goal_position=predicted_goal_position,
-            gt=gt_decoder,
-            center_gt_final_valid_idx=center_gt_final_valid_idx,
-        )
+        b_idx = torch.arange(gt_decoder.size(0), device=gt_decoder.device)
+        gt_goal = gt_decoder[b_idx, center_gt_final_valid_idx.long(), :2]
+        positive_goal_component = (predicted_goal_position.detach() - gt_goal[:, None]).norm(dim=-1).argmin(dim=-1)
         
         decoder_loss = self.get_decoder_loss_hard_assign(
             modes_preds=modes_preds,
@@ -222,130 +220,6 @@ class Criterion(nn.Module):
             total = total + layer_loss
 
         return total / num_layers
-    
-    @staticmethod
-    def _get_goal_path_cost(
-        goal_position,
-        gt,
-        center_gt_final_valid_idx,
-        lateral_sigma,
-        progress_sigma,
-    ):
-        """
-        Compute a Frenet-like cost between goals and the valid GT path.
-
-        The current target position (the local-coordinate origin) is prepended
-        to the future GT trajectory. Goals are projected onto the resulting
-        polyline and penalized separately by lateral distance and remaining
-        path progress. The first and last non-degenerate segments are extended
-        so that goals behind the start or beyond the endpoint still receive an
-        along-path progress error instead of an isotropic endpoint error.
-
-        Args:
-            goal_position: [B, ..., 2]
-            gt: [B, T, 5], with validity in the last channel
-            center_gt_final_valid_idx: [B]
-        Returns:
-            cost: [B, ...]
-        """
-        B = gt.size(0)
-        assert goal_position.shape[0] == B
-        assert goal_position.shape[-1] == 2
-
-        original_shape = goal_position.shape[1:-1]
-        goals = goal_position.reshape(B, -1, 2)
-        gt_xy = gt[..., :2].to(goal_position.dtype)
-        gt_valid = gt[..., -1].bool()
-
-        origin = torch.zeros(B, 1, 2, device=goal_position.device, dtype=goal_position.dtype)
-        path_points = torch.cat([origin, gt_xy], dim=1)
-        point_valid = torch.cat(
-            [torch.ones(B, 1, device=gt.device, dtype=torch.bool), gt_valid],
-            dim=1,
-        )
-
-        segment_start = path_points[:, :-1]
-        segment_delta = path_points[:, 1:] - segment_start
-        segment_length = segment_delta.norm(dim=-1)
-        segment_valid = point_valid[:, :-1] & point_valid[:, 1:] & (segment_length > 1e-6)
-
-        segment_length_sq = segment_delta.square().sum(dim=-1)
-        relative = goals[:, :, None, :] - segment_start[:, None, :, :]
-        raw_t = (relative * segment_delta[:, None]).sum(dim=-1)
-        raw_t = raw_t / segment_length_sq[:, None].clamp_min(1e-12)
-        clamped_t = raw_t.clamp(0.0, 1.0)
-
-        bounded_projection = segment_start[:, None] + clamped_t[..., None] * segment_delta[:, None]
-        bounded_sq_dist = (goals[:, :, None] - bounded_projection).square().sum(dim=-1)
-        bounded_sq_dist = bounded_sq_dist.masked_fill(~segment_valid[:, None], float('inf'))
-        selected_segment = bounded_sq_dist.argmin(dim=-1)
-
-        gather_idx = selected_segment[..., None]
-        selected_raw_t = raw_t.gather(2, gather_idx).squeeze(-1)
-        selected_clamped_t = clamped_t.gather(2, gather_idx).squeeze(-1)
-
-        segment_order = torch.arange(segment_valid.size(1), device=gt.device)[None]
-        first_segment = segment_valid.long().argmax(dim=-1)
-        last_segment = (segment_order * segment_valid.long()).max(dim=-1).values
-        extrapolate = (
-            (selected_segment == first_segment[:, None])
-            & (selected_raw_t < 0.0)
-        ) | (
-            (selected_segment == last_segment[:, None])
-            & (selected_raw_t > 1.0)
-        )
-        selected_t = torch.where(extrapolate, selected_raw_t, selected_clamped_t)
-
-        gather_index = selected_segment[..., None].expand(-1, -1, 2)
-        selected_start = segment_start.gather(1, gather_index)
-        selected_delta = segment_delta.gather(1, gather_index)
-        projection = selected_start + selected_t[..., None] * selected_delta
-        lateral_sq_dist = (goals - projection).square().sum(dim=-1)
-
-        valid_segment_length = segment_length * segment_valid
-        segment_end_progress = valid_segment_length.cumsum(dim=-1)
-        segment_start_progress = segment_end_progress - valid_segment_length
-        selected_start_progress = segment_start_progress.gather(1, selected_segment)
-        selected_length = segment_length.gather(1, selected_segment)
-        projected_progress = selected_start_progress + selected_t * selected_length
-        total_progress = segment_end_progress[:, -1]
-        progress_error = projected_progress - total_progress[:, None]
-
-        cost = (
-            0.5 * lateral_sq_dist / (lateral_sigma ** 2)
-            + 0.5 * progress_error.square() / (progress_sigma ** 2)
-        )
-
-        # Rows without a non-degenerate valid segment correspond to stationary
-        # (or invalid) GT. Use the endpoint distance for stationary rows; the
-        # caller masks invalid rows from the final loss.
-        has_path = segment_valid.any(dim=-1)
-        b_idx = torch.arange(B, device=gt.device)
-        final_idx = center_gt_final_valid_idx.long()
-        gt_goal = gt_xy[b_idx, final_idx]
-        endpoint_cost = (goals - gt_goal[:, None]).square().sum(dim=-1) * (0.5 / (lateral_sigma ** 2))
-        cost = torch.where(has_path[:, None], cost, endpoint_cost)
-
-        return cost.reshape(B, *original_shape)
-
-    def get_positive_goal_component(
-        self,
-        predicted_goal_position,
-        gt,
-        center_gt_final_valid_idx,
-    ):
-        """Hard-assign each sample using the weighted goal's GT-path cost."""
-        with torch.no_grad():
-            goal_path_cost = self._get_goal_path_cost(
-                goal_position=predicted_goal_position.detach(),
-                gt=gt,
-                center_gt_final_valid_idx=center_gt_final_valid_idx,
-                lateral_sigma=self.goal_prob_lateral_sigma,
-                progress_sigma=self.goal_prob_progress_sigma,
-            )
-            positive_goal_component = goal_path_cost.argmin(dim=-1)
-
-        return positive_goal_component
 
     # def get_goal_prob_loss(
     #     self,

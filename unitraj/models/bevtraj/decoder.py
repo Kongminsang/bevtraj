@@ -1,4 +1,5 @@
 import copy
+import math
 import pickle
 from pathlib import Path
 
@@ -228,6 +229,8 @@ class BEVTrajDecoder(nn.Module):
 
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
+        self.goal_select_q = nn.Linear(self.D, self.D, bias=False)
+        self.goal_select_k = nn.Linear(self.D * 2, self.D, bias=False)
         self.goal_scene_cross_attn = nn.MultiheadAttention(self.D, self.num_heads, dropout=self.dropout)
         self.goal_scene_norm = nn.LayerNorm(self.D)
 
@@ -403,25 +406,27 @@ class BEVTrajDecoder(nn.Module):
             )[0] + learned_query
         )
 
-        for layer_idx, layer in enumerate(self.goal_proposal):
+        for layer in self.goal_proposal:
             mode_query = layer['norm1'](
                 layer['self_attn'](mode_query, mode_query, mode_query, need_weights=False)[0] + mode_query
             )
             cross_query = torch.cat([mode_query, learned_query], dim=-1)
-            is_last_layer = layer_idx == len(self.goal_proposal) - 1
-            cross_query, cross_attn = layer['cross_attn'](
+            cross_query = layer['cross_attn'](
                 query=cross_query,
                 key=bda_key,
                 value=bda_value,
                 attn_mask=self.goal_attn_mask,
-                need_weights=is_last_layer,
-            )
+                need_weights=False,
+            )[0]
             mode_query = layer['norm2'](layer['q_proj'](cross_query) + mode_query)
             mode_query = layer['norm3'](layer['ffn'](mode_query))
 
-        goal_log_attn = cross_attn.float().clamp_min(1e-12).log() / self.goal_attn_temperature
-        goal_log_attn = goal_log_attn.masked_fill(self.goal_attn_mask[None], float('-inf'))
-        normalized_attn = goal_log_attn.softmax(dim=-1)
+        goal_q = self.goal_select_q(mode_query).permute(1, 0, 2)
+        goal_k = self.goal_select_k(bda_key.permute(1, 0, 2))
+        goal_logits = torch.einsum('bkd,bnd->bkn', goal_q, goal_k) / math.sqrt(self.D)
+        goal_logits = goal_logits.float() / self.goal_attn_temperature
+        goal_logits = goal_logits.masked_fill(self.goal_attn_mask[None], float('-inf'))
+        normalized_attn = goal_logits.softmax(dim=-1)
         goal_position = (bda_pos[:, None] * normalized_attn.unsqueeze(-1)).sum(dim=2)
         goal_position = goal_position.permute(1, 0, 2).contiguous()
 
