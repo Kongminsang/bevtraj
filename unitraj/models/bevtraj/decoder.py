@@ -694,8 +694,9 @@ class BEVTrajDecoder(nn.Module):
             rot_cos,
         ).reshape(B, M, self.T, 2).permute(1, 0, 2, 3)
 
-        # Temporal information is supplied by the per-timestep state query below.
-        mode_embed = mode_embed.unsqueeze(2).expand(-1, -1, self.T, -1)
+        time_pe = self.build_time_pe(B, M, mode_embed.dtype)
+        time_pe = time_pe.reshape(self.T, B, M, self.D).permute(2, 1, 0, 3)
+        mode_embed = mode_embed.unsqueeze(2) + time_pe
         query_scale = self.get_query_scale_itp(mode_embed)
 
         mode_embed = self.norm_l1[1](
