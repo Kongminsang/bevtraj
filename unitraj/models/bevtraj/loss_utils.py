@@ -62,8 +62,8 @@ class Criterion(nn.Module):
 
         return loss_acc, loss_jerk, loss_curvature
 
-    def get_positive_goal_weights(self, gt_goal):
-        """Return centroid-weighted positive modes whose anchor regions contain each GT goal."""
+    def get_positive_goal_weights(self, gt_goal, predicted_goal_position):
+        """Return predicted-goal-weighted positive modes whose anchor regions contain each GT goal."""
         with torch.no_grad():
             anchor_distance_sq = (
                 gt_goal[:, None, None] - self.goal_cluster_anchors[None]
@@ -76,10 +76,8 @@ class Criterion(nn.Module):
                 nearest_mode = min_anchor_distance_sq[missing_positive].argmin(dim=-1)
                 positive_mask[missing_positive, nearest_mode] = True
 
-            centroid_distance = torch.norm(
-                gt_goal[:, None] - self.goal_cluster_centroids[None], dim=-1
-            )
-            logits = -centroid_distance / self.goal_positive_temperature
+            goal_distance = torch.norm(gt_goal[:, None] - predicted_goal_position, dim=-1)
+            logits = -goal_distance / self.goal_positive_temperature
             return logits.masked_fill(~positive_mask, float('-inf')).softmax(dim=-1)
 
     def forward(self, out, gt, center_gt_final_valid_idx, traj_data):
@@ -101,7 +99,7 @@ class Criterion(nn.Module):
 
         b_idx = torch.arange(gt_decoder.size(0), device=gt_decoder.device)
         gt_goal = gt_decoder[b_idx, center_gt_final_valid_idx.long(), :2]
-        positive_goal_weights = self.get_positive_goal_weights(gt_goal)
+        positive_goal_weights = self.get_positive_goal_weights(gt_goal, predicted_goal_position)
         
         decoder_loss = self.get_decoder_loss(
             modes_preds=modes_preds,
@@ -313,7 +311,7 @@ class Criterion(nn.Module):
         """
         predicted_goal_position: [B, K, 2], attention-weighted goal coordinates
         goal_FDE: [B, K]
-        positive_goal_weights: [B, K], centroid-distance weights over cluster-matched modes
+        positive_goal_weights: [B, K], predicted-goal-distance weights over cluster-matched modes
         gt: [B, T, 5]  # (x, y, vx, vy, valid)
         center_gt_final_valid_idx: [B]
         """
