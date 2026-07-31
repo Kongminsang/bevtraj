@@ -259,6 +259,7 @@ MODEL:
         goal_prob_progress_sigma: 8.0
         goal_positive_distance_threshold: 4.0
         goal_positive_temperature: 5.0
+        traj_positive_temperature: 1.0
         # Existing per-component FDE quality auxiliary
         disp_weight: 1.0
         # decoder loss

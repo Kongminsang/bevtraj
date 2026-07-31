@@ -14,9 +14,8 @@ class Criterion(nn.Module):
         self.register_buffer('goal_cluster_anchors', goal_cluster_anchors.float(), persistent=False)
         self.register_buffer('goal_cluster_centroids', goal_cluster_centroids.float(), persistent=False)
         self.goal_positive_distance_threshold = float(self.config.get('goal_positive_distance_threshold', 4.0))
-        self.goal_positive_temperature = float(
-            self.config.get('goal_positive_temperature', self.goal_positive_distance_threshold)
-        )
+        self.goal_positive_temperature = float(self.config.get('goal_positive_temperature', 5.0))
+        self.traj_positive_temperature = float(self.config.get('traj_positive_temperature', 1.0))
         self.smoothness_dt = float(self.config.get('smoothness_dt', 0.1))
         self.curvature_min_speed = float(self.config.get('curvature_min_speed', 0.5))
         self.inv_smoothness_dt2 = 1.0 / (self.smoothness_dt ** 2)
@@ -225,8 +224,10 @@ class Criterion(nn.Module):
             pred_trajs_gmm = torch.cat([mu, log_std, rho], dim=-1)
 
             if positive_layer_idx >= 0:
-                dist = ((gt_xy[:, None] - mu.detach()).norm(dim=-1) * gt_mask[:, None]).sum(dim=-1)
-                logits = -dist / self.goal_positive_temperature
+                valid_count = gt_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                ade = ((gt_xy[:, None] - mu.detach()).norm(dim=-1) * gt_mask[:, None]).sum(dim=-1)
+                ade = ade / valid_count
+                logits = -ade / self.traj_positive_temperature
                 layer_positive_weights = logits.masked_fill(~positive_mask, float('-inf')).softmax(dim=-1)
 
             loss_reg_gmm = self.nll_loss_gmm_soft_assign(
