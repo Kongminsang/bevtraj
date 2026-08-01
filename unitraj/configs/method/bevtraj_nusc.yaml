@@ -214,8 +214,8 @@ MODEL:
         num_heads: 16
         score_time_stride_late_layers: 4
         score_time_full_refine_layers: 1
-        goal_anchor_file_name: 'cluster_10mode_96anchors_6s_v2.pkl'
-        trajectory_file_name: 'trajectory_set_64_60.pkl'
+        goal_anchor_file_name: 'cluster_10mode_64anchors_detailed_6s.pkl'
+        trajectory_file_name: 'trajectory_set_256_60.pkl'
 
         bda_dec:
             past_len: *past_len
@@ -252,14 +252,11 @@ MODEL:
             grid_size: *grid_size
 
     loss:
-        # SGCP anchor-distribution loss
+        # SGCP anchor-distribution auxiliary loss
         entropy_weight: 0.3
         kl_weight: 1.0
-        goal_prob_lateral_sigma: 2.5
-        goal_prob_progress_sigma: 8.0
-        goal_positive_distance_threshold: 4.0
-        goal_positive_temperature: 5.0
-        traj_positive_temperature: 1.0
+        goal_prob_sigma: 2.5
+        goal_prob_weight: 0.5
         # Existing per-component FDE quality auxiliary
         disp_weight: 1.0
         # decoder loss
