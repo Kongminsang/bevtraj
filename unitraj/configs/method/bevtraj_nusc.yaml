@@ -257,6 +257,9 @@ MODEL:
         kl_weight: 1.0
         goal_prob_sigma: 2.5
         goal_prob_weight: 0.5
+        goal_positive_distance_threshold: 4.0
+        goal_positive_temperature: 5.0
+        traj_positive_temperature: 0.2
         # Existing per-component FDE quality auxiliary
         disp_weight: 1.0
         # decoder loss
