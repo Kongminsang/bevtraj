@@ -14,8 +14,6 @@ class Criterion(nn.Module):
         self.register_buffer('goal_cluster_anchors', goal_cluster_anchors.float(), persistent=False)
         self.register_buffer('goal_cluster_centroids', goal_cluster_centroids.float(), persistent=False)
         self.goal_positive_distance_threshold = float(self.config.get('goal_positive_distance_threshold', 4.0))
-        self.goal_positive_temperature = float(self.config.get('goal_positive_temperature', 5.0))
-        self.traj_positive_temperature = float(self.config.get('traj_positive_temperature', 1.0))
         self.smoothness_dt = float(self.config.get('smoothness_dt', 0.1))
         self.curvature_min_speed = float(self.config.get('curvature_min_speed', 0.5))
         self.inv_smoothness_dt2 = 1.0 / (self.smoothness_dt ** 2)
@@ -61,7 +59,7 @@ class Criterion(nn.Module):
         return loss_acc, loss_jerk, loss_curvature
 
     def get_positive_goal_weights(self, gt_goal):
-        """Return centroid-weighted positive modes whose anchor regions contain each GT goal."""
+        """Return binary weights for modes whose anchor regions contain each GT goal."""
         with torch.no_grad():
             anchor_distance_sq = (
                 gt_goal[:, None, None] - self.goal_cluster_anchors[None]
@@ -74,11 +72,7 @@ class Criterion(nn.Module):
                 nearest_mode = min_anchor_distance_sq[missing_positive].argmin(dim=-1)
                 positive_mask[missing_positive, nearest_mode] = True
 
-            centroid_distance = torch.norm(
-                gt_goal[:, None] - self.goal_cluster_centroids[None], dim=-1
-            )
-            logits = -centroid_distance / self.goal_positive_temperature
-            return logits.masked_fill(~positive_mask, float('-inf')).softmax(dim=-1)
+            return positive_mask.to(gt_goal.dtype)
 
     def forward(self, out, gt, center_gt_final_valid_idx, traj_data):
         modes_preds = out['predicted_probability'] # [B, K]
@@ -213,21 +207,13 @@ class Criterion(nn.Module):
             positive_mask = positive_goal_weights[:, :pred_scores.size(1)] > 0
             select_mask = select_mask | positive_mask
 
-            if positive_layer_idx < 0:
-                layer_positive_weights = positive_goal_weights[:, :pred_scores.size(1)]
+            layer_positive_weights = positive_mask.to(pred_scores.dtype)
 
             # MTR nll_loss_gmm_direct expects log_std, but MotionRegHead outputs sigma
             mu = pred_trajs[..., :2]
             log_std = torch.log(pred_trajs[..., 2:4].clamp_min(1e-6))
             rho = pred_trajs[..., 4:5]
             pred_trajs_gmm = torch.cat([mu, log_std, rho], dim=-1)
-
-            if positive_layer_idx >= 0:
-                valid_count = gt_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                ade = ((gt_xy[:, None] - mu.detach()).norm(dim=-1) * gt_mask[:, None]).sum(dim=-1)
-                ade = ade / valid_count
-                logits = -ade / self.traj_positive_temperature
-                layer_positive_weights = logits.masked_fill(~positive_mask, float('-inf')).softmax(dim=-1)
 
             loss_reg_gmm = self.nll_loss_gmm_soft_assign(
                 pred_trajs=pred_trajs_gmm,
@@ -263,7 +249,7 @@ class Criterion(nn.Module):
         gt,
         center_gt_final_valid_idx,
     ):
-        """Train soft-matched modes' anchor distributions from endpoint distance."""
+        """Train positive modes' anchor distributions from endpoint distance."""
         eps = 1e-9
         entropy_weight = float(self.config.get('entropy_weight', 0.3))
         kl_weight = float(self.config.get('kl_weight', 1.0))
@@ -309,7 +295,7 @@ class Criterion(nn.Module):
         """
         predicted_goal_position: [B, K, 2], attention-weighted goal coordinates
         goal_FDE: [B, K]
-        positive_goal_weights: [B, K], centroid-distance weights over cluster-matched modes
+        positive_goal_weights: [B, K], binary weights over cluster-matched modes
         gt: [B, T, 5]  # (x, y, vx, vy, valid)
         center_gt_final_valid_idx: [B]
         """
