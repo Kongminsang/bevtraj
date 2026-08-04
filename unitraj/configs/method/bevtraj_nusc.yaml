@@ -214,6 +214,8 @@ MODEL:
         num_heads: 16
         score_time_stride_late_layers: 4
         score_time_full_refine_layers: 1
+        refinement_smoothing_kernel_size: 7
+        refinement_smoothing_sigma: 1.5
         goal_anchor_file_name: 'cluster_10mode_64anchors_detailed_6s.pkl'
         trajectory_file_name: 'trajectory_set_256_60.pkl'
 
@@ -257,9 +259,6 @@ MODEL:
         kl_weight: 1.0
         goal_prob_sigma: 2.5
         goal_prob_weight: 0.5
-        goal_positive_distance_threshold: 4.0
-        goal_positive_temperature: 5.0
-        traj_positive_temperature: 0.2
         # Existing per-component FDE quality auxiliary
         disp_weight: 1.0
         # decoder loss
@@ -272,6 +271,8 @@ MODEL:
         smoothness_dt: 0.1
         state_query_weight: 0.25
         dense_future_weight: 0.5
+        refinement_smoothing_sigma: 1.5
+        refinement_smoothing_weight: 0.1
         # EDA
         num_inter_layers: 2
         distinct_anchors: true

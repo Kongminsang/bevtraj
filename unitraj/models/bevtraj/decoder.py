@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from unitraj.models.bevtraj.bev_deformable_aggregation import BDA_DEC
 from unitraj.models.bevtraj.decoder_deform_attn import BEVDeformCrossAttn
@@ -194,6 +195,12 @@ class BEVTrajDecoder(nn.Module):
         self.num_heavy_refinement_score_layers = int(config.get('num_heavy_refinement_score_layers', 1))
         self.score_time_stride_late_layers = int(config.get('score_time_stride_late_layers', 1))
         self.score_time_full_refine_layers = int(config.get('score_time_full_refine_layers', 1))
+        self.refinement_smoothing_kernel_size = int(config.get('refinement_smoothing_kernel_size', 7))
+        self.refinement_smoothing_sigma = float(config.get('refinement_smoothing_sigma', 1.5))
+
+        smoothing_radius = self.refinement_smoothing_kernel_size // 2
+        smoothing_steps = torch.arange(-smoothing_radius, smoothing_radius + 1, dtype=torch.float32)
+        self.register_buffer('refinement_smoothing_steps', smoothing_steps, persistent=False)
         
         self.dca_cfg = config['deform_cross_attn']
         self.dca_cfg['dim'] = self.D
@@ -222,14 +229,10 @@ class BEVTrajDecoder(nn.Module):
         with open(file_path, 'rb') as f:
             goal_anchor_data = pickle.load(f)['VEHICLE']
         goal_anchor_indices = torch.as_tensor(goal_anchor_data['anchor_indices'], dtype=torch.long)
-        goal_cluster_anchors = torch.as_tensor(goal_anchor_data['mode_anchors'], dtype=torch.float32)
-        goal_cluster_centroids = torch.as_tensor(goal_anchor_data['centroids'], dtype=torch.float32)
         goal_attn_mask = torch.ones(self.K, self.bda_sgcp.anchors.size(0), dtype=torch.bool)
         goal_attn_mask.scatter_(1, goal_anchor_indices, False)
         self.register_buffer('goal_attn_mask', goal_attn_mask, persistent=False)
         self.register_buffer('goal_anchor_indices', goal_anchor_indices, persistent=False)
-        self.register_buffer('goal_cluster_anchors', goal_cluster_anchors, persistent=False)
-        self.register_buffer('goal_cluster_centroids', goal_cluster_centroids, persistent=False)
 
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
@@ -333,6 +336,12 @@ class BEVTrajDecoder(nn.Module):
         self.mode_prob_head = MLP(self.D, self.D, 1, 2)
         self.motion_reg = MotionRegHead(self.D)
         self.motion_vel = MotionVelHead(self.D)
+        self.refinement_smoothing_sigma_head = nn.Linear(self.D, 1)
+        nn.init.zeros_(self.refinement_smoothing_sigma_head.weight)
+        nn.init.constant_(
+            self.refinement_smoothing_sigma_head.bias,
+            math.log(math.expm1(self.refinement_smoothing_sigma)),
+        )
 
         # exp: sample-conditioned deterministic code
         # self.temp_pos_enc = TemporalPositionalEncoding(self.D, self.dropout, future_len=self.T, temperature=10000)
@@ -345,6 +354,23 @@ class BEVTrajDecoder(nn.Module):
         pe = pe.reshape(self.T, B * K, self.D)  # [T,BK,D]
 
         return self.time_emb_alpha * pe
+
+    def smooth_refinement_offset(self, raw_offset, sigma):
+        """Apply mode- and timestep-conditioned Gaussian smoothing along time."""
+        num_modes, batch_size, num_steps, _ = raw_offset.shape
+        offset_channels = raw_offset.permute(0, 1, 3, 2).reshape(num_modes * batch_size, 2, num_steps)
+        smoothing_radius = self.refinement_smoothing_kernel_size // 2
+        offset_windows = F.pad(
+            offset_channels,
+            (smoothing_radius, smoothing_radius),
+            mode='replicate',
+        ).unfold(-1, self.refinement_smoothing_kernel_size, 1)
+
+        steps = self.refinement_smoothing_steps.to(dtype=raw_offset.dtype)
+        weights = torch.exp(-0.5 * (steps / sigma.unsqueeze(-1)).square())
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        smooth_offset = (offset_windows * weights.reshape(num_modes * batch_size, 1, num_steps, -1)).sum(dim=-1)
+        return smooth_offset.reshape(num_modes, batch_size, 2, num_steps).permute(0, 1, 3, 2).contiguous()
 
     def get_late_score_time_indices(self, device):
         stride = self.score_time_stride_late_layers
@@ -767,6 +793,7 @@ class BEVTrajDecoder(nn.Module):
         mode_probs = [init_mode_prob]
         pred_trajs = [init_pred_traj.permute(0, 2, 1, 3)]
         pred_vels = [init_pred_vel.permute(0, 2, 1, 3)]
+        refinement_smoothing_sigmas = []
 
         ref_points = init_pred_traj[..., :2].detach().clone()
         num_modes = ref_points.size(0)
@@ -792,7 +819,13 @@ class BEVTrajDecoder(nn.Module):
                 )
             
             pred_traj_raw = self.motion_reg(dec_embed)          # [K, B, T, 5]
-            pred_xy = pred_traj_raw[..., :2] + ref_points
+            refinement_smoothing_sigma = F.softplus(
+                self.refinement_smoothing_sigma_head(dec_embed).squeeze(-1)
+            ).clamp_min(1e-3)
+            refinement_offset = self.smooth_refinement_offset(
+                pred_traj_raw[..., :2], refinement_smoothing_sigma
+            )
+            pred_xy = refinement_offset + ref_points
             pred_traj = torch.cat([pred_xy, pred_traj_raw[..., 2:]], dim=-1)
             ref_points = pred_xy.detach().clone()
 
@@ -820,6 +853,7 @@ class BEVTrajDecoder(nn.Module):
             mode_probs.append(mode_prob)
             pred_trajs.append(pred_traj)
             pred_vels.append(pred_vel)
+            refinement_smoothing_sigmas.append(refinement_smoothing_sigma)
             
             dec_embed = dec_embed.permute(2, 1, 0, 3).reshape(self.T, B * num_modes, -1)
             
@@ -830,6 +864,7 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_goal_probability': goal_probability,
                   'goal_anchor_position': goal_anchor_position,
                   'predicted_goal_FDE': goal_FDE,
+                  'refinement_smoothing_sigma': torch.stack(refinement_smoothing_sigmas),
                 #   'init_top_idx': init_top_idx,                # [B, K]
                   'state_pred': state_pred, # [B, T, 2]
                 }
