@@ -189,6 +189,8 @@ class BEVTrajDecoder(nn.Module):
         self.goal_score_hidden_dim = int(config.get('goal_score_hidden_dim', max(self.D // 4, 32)))
         self.goal_agent_distance_threshold = float(config.get('goal_agent_distance_threshold', 5.0))
         self.goal_attn_temperature = config.get('goal_attn_temperature', 0.1)
+        self.goal_path_pool_temperature = float(config.get('goal_path_pool_temperature', 0.5))
+        self.goal_path_time_stride = int(config.get('goal_path_time_stride', 4))
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
@@ -201,6 +203,9 @@ class BEVTrajDecoder(nn.Module):
         smoothing_radius = self.refinement_smoothing_kernel_size // 2
         smoothing_steps = torch.arange(-smoothing_radius, smoothing_radius + 1, dtype=torch.float32)
         self.register_buffer('refinement_smoothing_steps', smoothing_steps, persistent=False)
+        self.register_buffer(
+            'goal_path_time_indices', torch.arange(0, self.T, self.goal_path_time_stride), persistent=False
+        )
         
         self.dca_cfg = config['deform_cross_attn']
         self.dca_cfg['dim'] = self.D
@@ -264,6 +269,7 @@ class BEVTrajDecoder(nn.Module):
         self.register_buffer('goal_history_time', history_time.unsqueeze(-1), persistent=False)
 
         self.goal_FDE = MLP(self.D, self.D, 1, 2)
+        self.goal_path_step_score = MLP(self.D + 1, self.goal_score_hidden_dim, 1, 2)
 
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
 
@@ -273,6 +279,8 @@ class BEVTrajDecoder(nn.Module):
         with open(file_path, 'rb') as f:
             trajectory_set = pickle.load(f)['VEHICLE']
         self.register_buffer('trajectory_set', torch.from_numpy(trajectory_set).float(), persistent=False)
+        endpoint_distance = (self.bda_sgcp.anchors[:, None] - self.trajectory_set[None, :, -1]).square().sum(dim=-1)
+        self.register_buffer('goal_anchor_trajectory_indices', endpoint_distance.argmin(dim=-1), persistent=False)
 
         self.get_query_scale_itp = MLP(self.D, self.query_scale_dims, self.query_scale_dims, 2)
         self.norm_l1 = nn.ModuleList([nn.LayerNorm(self.D) for _ in range(3)])
@@ -378,6 +386,26 @@ class BEVTrajDecoder(nn.Module):
             return None
         return torch.arange(0, self.T, stride, device=device, dtype=torch.long)
 
+    def score_goal_anchor_trajectories(self, bda_token, bev_feat, ego_dyn):
+        """Score the BEV support along the predefined path to every dense anchor."""
+        B = bda_token.size(0)
+        anchor_trajectories = self.trajectory_set[self.goal_anchor_trajectory_indices]
+        anchor_trajectories = anchor_trajectories.index_select(1, self.goal_path_time_indices)
+        num_waypoints = anchor_trajectories.size(1)
+        pred_xy = anchor_trajectories[:, None].expand(-1, B, -1, -1)
+        traj_query = bda_token.permute(1, 0, 2).unsqueeze(2).expand(-1, -1, num_waypoints, -1)
+        bev_tokens, observed_mask = self.sample_traj_bev_tokens(
+            traj_query, pred_xy, bev_feat, ego_dyn, return_observed_mask=True
+        )
+
+        observed_feature = observed_mask.unsqueeze(-1).to(dtype=bev_tokens.dtype)
+        step_logits = self.goal_path_step_score(torch.cat([bev_tokens, observed_feature], dim=-1)).squeeze(-1).float()
+        temperature = self.goal_path_pool_temperature
+        path_logits = -temperature * (
+            torch.logsumexp(-step_logits / temperature, dim=-1) - math.log(num_waypoints)
+        )
+        return path_logits.T
+
     def goal_candidate_proposal(
         self,
         bev_feat,
@@ -454,7 +482,8 @@ class BEVTrajDecoder(nn.Module):
         goal_q = self.goal_select_q(mode_query).permute(1, 0, 2)
         goal_k = self.goal_select_k(bda_key.permute(1, 0, 2))
         goal_logits = torch.einsum('bkd,bnd->bkn', goal_q, goal_k) / math.sqrt(self.D)
-        goal_logits = goal_logits.float() / self.goal_attn_temperature
+        goal_path_logits = self.score_goal_anchor_trajectories(bda_token, bev_feat, ego_dyn)
+        goal_logits = (goal_logits.float() + goal_path_logits[:, None]) / self.goal_attn_temperature
         goal_logits = goal_logits.masked_fill(self.goal_attn_mask[None], float('-inf'))
         normalized_attn = goal_logits.softmax(dim=-1)
         goal_position = (bda_pos[:, None] * normalized_attn.unsqueeze(-1)).sum(dim=2)
@@ -493,7 +522,7 @@ class BEVTrajDecoder(nn.Module):
         )
         return self.traj_motion_proj(traj_feat)
 
-    def sample_traj_bev_tokens(self, traj_query, pred_xy, bev_feat, ego_dyn):
+    def sample_traj_bev_tokens(self, traj_query, pred_xy, bev_feat, ego_dyn, return_observed_mask=False):
         M, B, T, _ = pred_xy.shape
         trans_x, trans_y, rot_sin, rot_cos = (
             ego_dyn['ego_x'],
@@ -505,6 +534,7 @@ class BEVTrajDecoder(nn.Module):
         pred_xy_flat = pred_xy.permute(1, 0, 2, 3).reshape(B, M * T, 2)
         pred_xy_ego = target_to_ego(pred_xy_flat, trans_x, trans_y, rot_sin, rot_cos)
         pred_xy_ego = pred_xy_ego.reshape(B, M, T, 2).permute(1, 0, 2, 3).contiguous()
+        observed_mask = (pred_xy_ego.abs() <= self.denorm_scale[None, None, None]).all(dim=-1)
 
         bev_tokens = self.traj_bev_cross_attn(
             dec_embed=traj_query,
@@ -513,7 +543,10 @@ class BEVTrajDecoder(nn.Module):
             ref_points=pred_xy_ego,
             identity=torch.zeros_like(traj_query),
         )
-        return self.traj_bev_proj(bev_tokens)
+        bev_tokens = self.traj_bev_proj(bev_tokens)
+        if return_observed_mask:
+            return bev_tokens, observed_mask
+        return bev_tokens
 
     def build_dynamic_context(self, traj_query, tc_dyn):
         M, B, T, D = traj_query.shape
@@ -634,12 +667,6 @@ class BEVTrajDecoder(nn.Module):
         fused = self.traj_score_norm(fused)
         fused = self.traj_score_ffn(fused)
         return mode_prob_head(fused).squeeze(dim=-1).T
-
-    def score_predicted_trajectory_cheap(self, dec_embed, pred_traj, pred_vel, bev_feat, ego_dyn):
-        pred_xy = pred_traj[..., :2]
-        motion_tokens = self.build_traj_motion_tokens(pred_traj, pred_vel)
-        traj_query = dec_embed + motion_tokens
-        return self.traj_score_cheap(traj_query, pred_xy, bev_feat, ego_dyn)
 
     def initial_prediction(
         self,
