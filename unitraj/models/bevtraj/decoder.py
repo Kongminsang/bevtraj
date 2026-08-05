@@ -189,7 +189,7 @@ class BEVTrajDecoder(nn.Module):
         self.goal_score_hidden_dim = int(config.get('goal_score_hidden_dim', max(self.D // 4, 32)))
         self.goal_agent_distance_threshold = float(config.get('goal_agent_distance_threshold', 5.0))
         self.goal_attn_temperature = config.get('goal_attn_temperature', 0.1)
-        self.goal_path_pool_temperature = float(config.get('goal_path_pool_temperature', 0.5))
+        self.bev_path_softmin_temperature = float(config.get('bev_path_softmin_temperature', 0.5))
         self.goal_path_time_stride = int(config.get('goal_path_time_stride', 4))
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
@@ -304,6 +304,7 @@ class BEVTrajDecoder(nn.Module):
         self.traj_bev_query_scale = MLP(self.D, self.query_scale_dims, self.query_scale_dims, 2)
         self.traj_bev_cross_attn = BEVDeformCrossAttn(**self.dca_itr_cfg)
         self.traj_bev_proj = MLP(self.D, self.D, self.D, 2)
+        self.traj_bev_step_score = MLP(self.D + 1, self.goal_score_hidden_dim, 1, 2)
         self.traj_interaction_proj = MLP(6, self.D, self.D, 2)
         self.traj_scene_context_proj = MLP(self.D, self.D, self.D, 2)
         self.traj_interaction_fuse_proj = MLP(self.D * 2, self.D, self.D, 2)
@@ -400,9 +401,9 @@ class BEVTrajDecoder(nn.Module):
 
         observed_feature = observed_mask.unsqueeze(-1).to(dtype=bev_tokens.dtype)
         step_logits = self.goal_path_step_score(torch.cat([bev_tokens, observed_feature], dim=-1)).squeeze(-1).float()
-        temperature = self.goal_path_pool_temperature
+        temperature = self.bev_path_softmin_temperature
         path_logits = -temperature * (
-            torch.logsumexp(-step_logits / temperature, dim=-1) - math.log(num_waypoints)
+            torch.logsumexp(-step_logits / temperature, dim=-1) - math.log(step_logits.size(-1))
         )
         return path_logits.T
 
@@ -644,7 +645,9 @@ class BEVTrajDecoder(nn.Module):
         traj_query = dec_embed + motion_tokens
 
         dyn_tokens = self.build_dynamic_context(traj_query, tc_dyn)
-        bev_tokens = self.sample_traj_bev_tokens(traj_query, pred_xy, bev_feat, ego_dyn)
+        bev_tokens, observed_mask = self.sample_traj_bev_tokens(
+            traj_query, pred_xy, bev_feat, ego_dyn, return_observed_mask=True
+        )
         interaction_tokens = self.build_interaction_tokens(
             pred_xy,
             pred_vel,
@@ -666,7 +669,16 @@ class BEVTrajDecoder(nn.Module):
         fused = self.traj_score_fuse(fused)
         fused = self.traj_score_norm(fused)
         fused = self.traj_score_ffn(fused)
-        return mode_prob_head(fused).squeeze(dim=-1).T
+        mode_logits = mode_prob_head(fused).squeeze(dim=-1).T
+
+        observed_feature = observed_mask.unsqueeze(-1).to(dtype=bev_tokens.dtype)
+        step_logits = self.traj_bev_step_score(torch.cat([bev_tokens, observed_feature], dim=-1)).squeeze(-1).float()
+        temperature = self.bev_path_softmin_temperature
+        bev_path_logits = -temperature * (
+            torch.logsumexp(-step_logits / temperature, dim=-1) - math.log(step_logits.size(-1))
+        )
+        bev_path_logits = bev_path_logits.T
+        return mode_logits + bev_path_logits
 
     def initial_prediction(
         self,
