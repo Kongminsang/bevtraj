@@ -6,7 +6,6 @@ from torch.nn import functional as F
 import numpy as np
 
 from mmengine.structures import InstanceData
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def sigmoid_xent_loss(
     inputs: torch.Tensor,
@@ -14,7 +13,7 @@ def sigmoid_xent_loss(
     reduction: str = "mean",
 ) -> torch.Tensor:
     inputs = inputs.float()
-    targets = targets.float()
+    targets = targets.to(device=inputs.device, dtype=torch.float32)
     return F.binary_cross_entropy_with_logits(inputs, targets, reduction=reduction)
 
 
@@ -26,7 +25,7 @@ def sigmoid_focal_loss(
     reduction: str = "mean",
 ) -> torch.Tensor:
     inputs = inputs.float()
-    targets = targets.float().to(device)
+    targets = targets.to(device=inputs.device, dtype=torch.float32)
     p = torch.sigmoid(inputs)
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = p * targets + (1 - p) * (1 - targets)
@@ -118,7 +117,7 @@ class BEVSegmentationHead(nn.Module):
             nn.BatchNorm2d(in_channels),
             nn.ReLU(True),
             nn.Conv2d(in_channels, len(classes), 1),
-        ).to(device)
+        )
         
     def forward(
         self,
