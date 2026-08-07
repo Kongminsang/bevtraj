@@ -18,27 +18,6 @@ from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA, Tempo
 MODEL_DIR = Path(__file__).resolve().parent
 
 
-class QueryConditionedDynamics(nn.Module):
-    """FiLM-condition feature tokens with a broadcastable query embedding."""
-
-    def __init__(self, query_dim, hidden_dim):
-        super().__init__()
-
-        self.modulator = nn.Sequential(
-            nn.Linear(query_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 2 * hidden_dim),
-        )
-
-        # Start from an identity transform and learn query-specific modulation.
-        nn.init.zeros_(self.modulator[-1].weight)
-        nn.init.zeros_(self.modulator[-1].bias)
-
-    def forward(self, dynamics, query_emb):
-        gamma, beta = self.modulator(query_emb).chunk(2, dim=-1)
-        return (1 + gamma) * dynamics + beta
-
-
 class BEVTrajDecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -260,14 +239,6 @@ class BEVTrajDecoder(nn.Module):
                 'norm3': nn.LayerNorm(self.D),
             }))
 
-        self.goal_motion_encoder = MLP(self.target_attr, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
-        self.goal_motion_time_encoder = MLP(1, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
-        self.goal_motion_attn = nn.MultiheadAttention(self.goal_score_hidden_dim, 4, dropout=0.0, batch_first=True)
-        self.goal_motion_pool = MLP(2 * self.goal_score_hidden_dim, self.goal_score_hidden_dim, self.goal_score_hidden_dim, 2)
-        self.goal_motion_conditioner = QueryConditionedDynamics(self.goal_score_hidden_dim, self.D)
-        history_time = (torch.arange(self.t, dtype=torch.float32) - self.t + 1) * float(config.get('dt', 0.1))
-        self.register_buffer('goal_history_time', history_time.unsqueeze(-1), persistent=False)
-
         self.goal_FDE = MLP(self.D, self.D, 1, 2)
         self.goal_path_step_score = MLP(self.D + 1, self.goal_score_hidden_dim, 1, 2)
 
@@ -411,14 +382,15 @@ class BEVTrajDecoder(nn.Module):
         self,
         bev_feat,
         ec_dyn,
-        tc_dyn,
         ego_dyn,
         scene_context,
         agent_history,
         target_idx,
         scene_key_padding_mask=None,
     ):
-        bda_token, bda_pos = self.bda_sgcp(bev_feat, ec_dyn, tc_dyn, ego_dyn)
+        bda_token, bda_pos = self.bda_sgcp(
+            bev_feat, ec_dyn, tc_dyn=None, ego_dyn=ego_dyn
+        )
         B = bda_token.size(0)
         bda_pos_embed = gen_sineembed_for_position(
             bda_pos, hidden_dim=self.D, temperature=self.spa_pos_T
@@ -426,23 +398,14 @@ class BEVTrajDecoder(nn.Module):
         bda_key = torch.cat([bda_token, bda_pos_embed], dim=-1).permute(1, 0, 2)
         bda_value = bda_token.permute(1, 0, 2)
 
-        motion_tokens = self.goal_motion_encoder(tc_dyn)
-        motion_time_pe = self.goal_motion_time_encoder(self.goal_history_time.to(motion_tokens.dtype))[None]
-        target_idx = target_idx.to(device=motion_tokens.device, dtype=torch.long)
-        batch_idx = torch.arange(B, device=motion_tokens.device)
-        target_valid_mask = agent_history['valid_mask'][batch_idx, target_idx].bool()
-        attended_motion = self.goal_motion_attn(
-            motion_tokens[:, -1:] + motion_time_pe[:, -1:],
-            motion_tokens + motion_time_pe,
-            motion_tokens,
-            key_padding_mask=~target_valid_mask,
-            need_weights=False,
-        )[0][:, 0]
-        motion_context = self.goal_motion_pool(torch.cat([motion_tokens[:, -1], attended_motion], dim=-1))[None]
-        learned_query = self.goal_motion_conditioner(self.goal_query.expand(-1, B, -1), motion_context)
+        # Target-history-motion ablation: use the learned goal queries without
+        # conditioning them on tc_dyn.
+        learned_query = self.goal_query.expand(-1, B, -1)
 
         history_pos = agent_history['positions'].float()
         history_valid = agent_history['valid_mask'].bool()
+        target_idx = target_idx.to(device=history_pos.device, dtype=torch.long)
+        batch_idx = torch.arange(B, device=history_pos.device)
         cluster_anchors = self.bda_sgcp.anchors[self.goal_anchor_indices].float()
         threshold_sq = self.goal_agent_distance_threshold ** 2
         agents_in_mode = []
@@ -804,7 +767,6 @@ class BEVTrajDecoder(nn.Module):
             self.goal_candidate_proposal(
                 bev_feat,
                 ec_dyn,
-                tc_dyn,
                 ego_dyn,
                 scene_context,
                 agent_history,
