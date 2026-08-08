@@ -10,7 +10,7 @@ from unitraj.models.bevtraj.linear import build_mlp, FFN
 from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to_ego
 
 
-MODEL_DIR = Path(__file__).resolve().parent
+ASSET_DIR = Path(__file__).resolve().parent / 'assets'
 
 
 class DeformAttn(nn.Module):
@@ -152,7 +152,7 @@ class BDA_ENC(BEVDeformableAggregation):
         self.anchor_file_name = config['anchor_file_name']
 
         if self.use_anchor_points:
-            file_path = MODEL_DIR / self.anchor_file_name
+            file_path = ASSET_DIR / self.anchor_file_name
             with open(file_path, 'rb') as f:
                 anchors = pickle.load(f)
             self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
@@ -250,7 +250,7 @@ class BDA_DEC(BEVDeformableAggregation):
         ])
 
         self.anchor_file_name = config['anchor_file_name']
-        file_path = MODEL_DIR / self.anchor_file_name
+        file_path = ASSET_DIR / self.anchor_file_name
         with open(file_path, 'rb') as f:
             anchors = pickle.load(f)
         self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())

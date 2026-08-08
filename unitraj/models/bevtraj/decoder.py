@@ -14,7 +14,7 @@ from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA, Tempo
 from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to_ego
 
 
-MODEL_DIR = Path(__file__).resolve().parent
+ASSET_DIR = Path(__file__).resolve().parent / 'assets'
 
 
 class QueryConditionedDynamics(nn.Module):
@@ -215,7 +215,7 @@ class BEVTrajDecoder(nn.Module):
         self.bda_sgcp = BDA_DEC(self.config['bda_dec'], self.D)
 
         self.goal_anchor_file_name = config['goal_anchor_file_name']
-        file_path = MODEL_DIR / self.goal_anchor_file_name
+        file_path = ASSET_DIR / self.goal_anchor_file_name
         with open(file_path, 'rb') as f:
             goal_anchor_data = pickle.load(f)['VEHICLE']
         goal_anchor_indices = torch.as_tensor(goal_anchor_data['anchor_indices'], dtype=torch.long)
@@ -260,7 +260,7 @@ class BEVTrajDecoder(nn.Module):
 
         # ============================ Initial Prediction ==============================
         self.trajectory_file_name = config['trajectory_file_name']
-        file_path = MODEL_DIR / self.trajectory_file_name
+        file_path = ASSET_DIR / self.trajectory_file_name
         with open(file_path, 'rb') as f:
             trajectory_set = pickle.load(f)['VEHICLE']
         self.register_buffer('trajectory_set', torch.from_numpy(trajectory_set).float(), persistent=False)
