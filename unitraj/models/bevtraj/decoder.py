@@ -173,9 +173,7 @@ class BEVTrajDecoder(nn.Module):
         self.L_goal_proposal = config['num_goal_proposal_layers']
         self.goal_score_hidden_dim = int(config.get('goal_score_hidden_dim', max(self.D // 4, 32)))
         self.goal_agent_distance_threshold = float(config.get('goal_agent_distance_threshold', 5.0))
-        self.goal_attn_temperature = config.get('goal_attn_temperature', 0.1)
         self.bev_path_softmin_temperature = float(config.get('bev_path_softmin_temperature', 0.5))
-        self.goal_path_time_stride = int(config.get('goal_path_time_stride', 4))
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
         self.grid_size = config['grid_size']
@@ -188,10 +186,7 @@ class BEVTrajDecoder(nn.Module):
         smoothing_radius = self.refinement_smoothing_kernel_size // 2
         smoothing_steps = torch.arange(-smoothing_radius, smoothing_radius + 1, dtype=torch.float32)
         self.register_buffer('refinement_smoothing_steps', smoothing_steps, persistent=False)
-        self.register_buffer(
-            'goal_path_time_indices', torch.arange(0, self.T, self.goal_path_time_stride), persistent=False
-        )
-        
+
         self.dca_cfg = config['deform_cross_attn']
         self.dca_cfg['dim'] = self.D
 
@@ -219,15 +214,19 @@ class BEVTrajDecoder(nn.Module):
         with open(file_path, 'rb') as f:
             goal_anchor_data = pickle.load(f)['VEHICLE']
         goal_anchor_indices = torch.as_tensor(goal_anchor_data['anchor_indices'], dtype=torch.long)
+        goal_cluster_centroids = torch.as_tensor(goal_anchor_data['centroids'], dtype=torch.float32)
+        if goal_anchor_indices.size(0) != self.K or goal_cluster_centroids.shape != (self.K, 2):
+            raise ValueError(
+                f'{self.goal_anchor_file_name} must contain {self.K} anchor clusters and centroids'
+            )
         goal_attn_mask = torch.ones(self.K, self.bda_sgcp.anchors.size(0), dtype=torch.bool)
         goal_attn_mask.scatter_(1, goal_anchor_indices, False)
         self.register_buffer('goal_attn_mask', goal_attn_mask, persistent=False)
         self.register_buffer('goal_anchor_indices', goal_anchor_indices, persistent=False)
+        self.register_buffer('goal_cluster_centroids', goal_cluster_centroids, persistent=False)
 
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
-        self.goal_select_q = nn.Linear(self.D, self.D, bias=False)
-        self.goal_select_k = nn.Linear(self.D * 2, self.D, bias=False)
         self.goal_scene_cross_attn = nn.MultiheadAttention(self.D, self.num_heads, dropout=self.dropout)
         self.goal_scene_norm = nn.LayerNorm(self.D)
 
@@ -253,8 +252,8 @@ class BEVTrajDecoder(nn.Module):
         history_time = (torch.arange(self.t, dtype=torch.float32) - self.t + 1) * float(config.get('dt', 0.1))
         self.register_buffer('goal_history_time', history_time.unsqueeze(-1), persistent=False)
 
+        self.trajectory_head = MLP(self.D, self.D, 2, 2)
         self.goal_FDE = MLP(self.D, self.D, 1, 2)
-        self.goal_path_step_score = MLP(self.D + 1, self.goal_score_hidden_dim, 1, 2)
 
         self.register_buffer('denorm_scale', torch.tensor(self.grid_size, dtype=torch.float32))
 
@@ -264,8 +263,6 @@ class BEVTrajDecoder(nn.Module):
         with open(file_path, 'rb') as f:
             trajectory_set = pickle.load(f)['VEHICLE']
         self.register_buffer('trajectory_set', torch.from_numpy(trajectory_set).float(), persistent=False)
-        endpoint_distance = (self.bda_sgcp.anchors[:, None] - self.trajectory_set[None, :, -1]).square().sum(dim=-1)
-        self.register_buffer('goal_anchor_trajectory_indices', endpoint_distance.argmin(dim=-1), persistent=False)
 
         self.get_query_scale_itp = MLP(self.D, self.query_scale_dims, self.query_scale_dims, 2)
         self.norm_l1 = nn.ModuleList([nn.LayerNorm(self.D) for _ in range(3)])
@@ -361,26 +358,6 @@ class BEVTrajDecoder(nn.Module):
             return None
         return torch.arange(0, self.T, stride, device=device, dtype=torch.long)
 
-    def score_goal_anchor_trajectories(self, bda_token, bev_feat, ego_dyn):
-        """Score the BEV support along the predefined path to every dense anchor."""
-        B = bda_token.size(0)
-        anchor_trajectories = self.trajectory_set[self.goal_anchor_trajectory_indices]
-        anchor_trajectories = anchor_trajectories.index_select(1, self.goal_path_time_indices)
-        num_waypoints = anchor_trajectories.size(1)
-        pred_xy = anchor_trajectories[:, None].expand(-1, B, -1, -1)
-        traj_query = bda_token.permute(1, 0, 2).unsqueeze(2).expand(-1, -1, num_waypoints, -1)
-        bev_tokens, observed_mask = self.sample_traj_bev_tokens(
-            traj_query, pred_xy, bev_feat, ego_dyn, return_observed_mask=True
-        )
-
-        observed_feature = observed_mask.unsqueeze(-1).to(dtype=bev_tokens.dtype)
-        step_logits = self.goal_path_step_score(torch.cat([bev_tokens, observed_feature], dim=-1)).squeeze(-1).float()
-        temperature = self.bev_path_softmin_temperature
-        path_logits = -temperature * (
-            torch.logsumexp(-step_logits / temperature, dim=-1) - math.log(step_logits.size(-1))
-        )
-        return path_logits.T
-
     def goal_candidate_proposal(
         self,
         bev_feat,
@@ -453,15 +430,7 @@ class BEVTrajDecoder(nn.Module):
             mode_query = layer['norm2'](layer['q_proj'](cross_query) + mode_query)
             mode_query = layer['norm3'](layer['ffn'](mode_query))
 
-        goal_q = self.goal_select_q(mode_query).permute(1, 0, 2)
-        goal_k = self.goal_select_k(bda_key.permute(1, 0, 2))
-        goal_logits = torch.einsum('bkd,bnd->bkn', goal_q, goal_k) / math.sqrt(self.D)
-        goal_path_logits = self.score_goal_anchor_trajectories(bda_token, bev_feat, ego_dyn)
-        goal_logits = (goal_logits.float() + goal_path_logits[:, None]) / self.goal_attn_temperature
-        goal_logits = goal_logits.masked_fill(self.goal_attn_mask[None], float('-inf'))
-        normalized_attn = goal_logits.softmax(dim=-1)
-        goal_position = (bda_pos[:, None] * normalized_attn.unsqueeze(-1)).sum(dim=2)
-        goal_position = goal_position.permute(1, 0, 2).contiguous()
+        goal_position = self.trajectory_head(mode_query)
 
         goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
         return mode_query, goal_position, goal_FDE
@@ -868,6 +837,7 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
                   'predicted_goal_position': predicted_goal_position,
+                  'goal_cluster_centroids': self.goal_cluster_centroids,
                   'predicted_goal_FDE': goal_FDE,
                   'refinement_smoothing_sigma': torch.stack(refinement_smoothing_sigmas),
                 #   'init_top_idx': init_top_idx,                # [B, K]
