@@ -463,12 +463,8 @@ class BEVTrajDecoder(nn.Module):
         goal_position = (bda_pos[:, None] * normalized_attn.unsqueeze(-1)).sum(dim=2)
         goal_position = goal_position.permute(1, 0, 2).contiguous()
 
-        cluster_indices = self.goal_anchor_indices[None].expand(B, -1, -1)
-        goal_probability = normalized_attn.gather(dim=-1, index=cluster_indices)
-        goal_anchor_position = bda_pos[:, self.goal_anchor_indices]
-
         goal_FDE = self.goal_FDE(mode_query).squeeze(-1).T
-        return mode_query, goal_position, goal_probability, goal_anchor_position, goal_FDE
+        return mode_query, goal_position, goal_FDE
 
     def build_traj_motion_tokens(self, pred_traj, pred_vel):
         pred_xy = pred_traj[..., :2]
@@ -773,7 +769,7 @@ class BEVTrajDecoder(nn.Module):
         scene_key_padding_mask = ~obj_valid_mask.bool() if obj_valid_mask is not None else None
 
         # -------------------Goal Candidate Proposal -----------------
-        mode_query, goal_position, goal_probability, goal_anchor_position, goal_FDE = \
+        mode_query, goal_position, goal_FDE = \
             self.goal_candidate_proposal(
                 bev_feat,
                 tc_dyn,
@@ -872,8 +868,6 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
                   'predicted_goal_position': predicted_goal_position,
-                  'predicted_goal_probability': goal_probability,
-                  'goal_anchor_position': goal_anchor_position,
                   'predicted_goal_FDE': goal_FDE,
                   'refinement_smoothing_sigma': torch.stack(refinement_smoothing_sigmas),
                 #   'init_top_idx': init_top_idx,                # [B, K]

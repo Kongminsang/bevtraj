@@ -15,7 +15,6 @@ class Criterion(nn.Module):
         self.curvature_min_speed = float(self.config.get('curvature_min_speed', 0.5))
         self.inv_smoothness_dt2 = 1.0 / (self.smoothness_dt ** 2)
         self.inv_smoothness_dt3 = 1.0 / (self.smoothness_dt ** 3)
-        self.goal_prob_sigma = float(self.config.get('goal_prob_sigma', 2.5))
         self.refinement_smoothing_sigma = float(self.config.get('refinement_smoothing_sigma', 1.5))
 
     def get_trajectory_smoothness_loss(self, pred_xy, valid_mask):
@@ -54,8 +53,6 @@ class Criterion(nn.Module):
         pred_vels = out['predicted_velocity'] # [K, T, B, 2]
 
         predicted_goal_position = out['predicted_goal_position']
-        goal_probability = out['predicted_goal_probability']
-        goal_anchor_position = out['goal_anchor_position']
         goal_FDE = out['predicted_goal_FDE']
 
         dense_future_pred = out['dense_future_pred']
@@ -79,14 +76,6 @@ class Criterion(nn.Module):
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
 
-        goal_prob_loss = self.get_goal_prob_loss(
-            goal_probability=goal_probability,
-            goal_anchor_position=goal_anchor_position,
-            positive_goal_component=positive_goal_component,
-            gt=gt_decoder,
-            center_gt_final_valid_idx=center_gt_final_valid_idx,
-        )
-
         goal_prediction_loss = self.get_goal_prediction_loss(
             predicted_goal_position=predicted_goal_position,
             goal_FDE=goal_FDE,
@@ -103,9 +92,8 @@ class Criterion(nn.Module):
             out['refinement_smoothing_sigma'] - self.refinement_smoothing_sigma
         ).square().mean()
 
-        goal_prob_weight = float(self.config.get('goal_prob_weight', 1.0))
         refinement_smoothing_weight = float(self.config.get('refinement_smoothing_weight', 0.1))
-        total_loss = decoder_loss + goal_prediction_loss + goal_prob_weight * goal_prob_loss + state_query_loss + dense_future_loss
+        total_loss = decoder_loss + goal_prediction_loss + state_query_loss + dense_future_loss
         total_loss = total_loss + refinement_smoothing_weight * refinement_smoothing_loss
         return total_loss
 
@@ -226,48 +214,6 @@ class Criterion(nn.Module):
             total = total + layer_loss
 
         return total / num_layers
-
-    def get_goal_prob_loss(
-        self,
-        goal_probability,
-        goal_anchor_position,
-        positive_goal_component,
-        gt,
-        center_gt_final_valid_idx,
-    ):
-        """Train the hard-assigned mode's anchor distribution from endpoint distance."""
-        eps = 1e-9
-        entropy_weight = float(self.config.get('entropy_weight', 0.3))
-        kl_weight = float(self.config.get('kl_weight', 1.0))
-
-        B, K, A = goal_probability.shape
-        assert goal_anchor_position.shape == (B, K, A, 2)
-        assert positive_goal_component.shape == (B,)
-
-        device = goal_probability.device
-        b_idx = torch.arange(B, device=device)
-        final_idx = center_gt_final_valid_idx.long()
-        gt_goal = gt[b_idx, final_idx, :2]
-        valid_final = gt[b_idx, final_idx, -1].float()
-        valid_count = valid_final.sum().clamp_min(1.0)
-
-        goal_probability = goal_probability[b_idx, positive_goal_component]
-        goal_anchor_position = goal_anchor_position[b_idx, positive_goal_component]
-        sq_dist = (goal_anchor_position - gt_goal[:, None]).square().sum(dim=-1)
-        log_likelihood = -0.5 * sq_dist / (self.goal_prob_sigma ** 2)
-        prior = goal_probability.clamp_min(eps)
-        prior = prior / prior.sum(dim=-1, keepdim=True)
-        log_prior = prior.log()
-        log_posterior = log_likelihood + log_prior
-        log_posterior = log_posterior - torch.logsumexp(log_posterior, dim=-1, keepdim=True)
-        posterior = log_posterior.exp()
-        nll_per_sample = ((-log_likelihood) * posterior).sum(dim=-1)
-        nll = (nll_per_sample * valid_final).sum() / valid_count
-        entropy_per_sample = -(posterior * log_posterior).sum(dim=-1)
-        posterior_entropy = (entropy_per_sample * valid_final).sum() / valid_count
-        kl_per_sample = (posterior * (log_posterior - log_prior)).sum(dim=-1)
-        kl_loss = (kl_per_sample * valid_final).sum() / valid_count
-        return nll + entropy_weight * posterior_entropy + kl_weight * kl_loss
 
     def get_goal_prediction_loss(
         self,
