@@ -48,7 +48,7 @@ class Criterion(nn.Module):
 
         return loss_acc, loss_jerk, loss_curvature
 
-    def forward(self, out, gt, center_gt_final_valid_idx, traj_data):
+    def forward(self, out, gt, center_gt_final_valid_idx):
         modes_preds = out['predicted_probability'] # [B, K]
         preds = out['predicted_trajectory'] # [K, T, B, 5]
         pred_vels = out['predicted_velocity'] # [K, T, B, 2]
@@ -87,9 +87,10 @@ class Criterion(nn.Module):
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
 
-        goal_fde_loss = self.get_goal_fde_loss(
+        goal_prediction_loss = self.get_goal_prediction_loss(
             predicted_goal_position=predicted_goal_position,
             goal_FDE=goal_FDE,
+            positive_goal_component=positive_goal_component,
             gt=gt_decoder,
             center_gt_final_valid_idx=center_gt_final_valid_idx,
         )
@@ -102,8 +103,9 @@ class Criterion(nn.Module):
             out['refinement_smoothing_sigma'] - self.refinement_smoothing_sigma
         ).square().mean()
 
+        goal_prob_weight = float(self.config.get('goal_prob_weight', 1.0))
         refinement_smoothing_weight = float(self.config.get('refinement_smoothing_weight', 0.1))
-        total_loss = decoder_loss + goal_prob_loss + goal_fde_loss + state_query_loss + dense_future_loss
+        total_loss = decoder_loss + goal_prediction_loss + goal_prob_weight * goal_prob_loss + state_query_loss + dense_future_loss
         total_loss = total_loss + refinement_smoothing_weight * refinement_smoothing_loss
         return total_loss
 
@@ -267,15 +269,16 @@ class Criterion(nn.Module):
         kl_loss = (kl_per_sample * valid_final).sum() / valid_count
         return nll + entropy_weight * posterior_entropy + kl_weight * kl_loss
 
-    def get_goal_fde_loss(
+    def get_goal_prediction_loss(
         self,
         predicted_goal_position,
         goal_FDE,
+        positive_goal_component,
         gt,
         center_gt_final_valid_idx,
     ):
         """
-        predicted_goal_position: [B, K, 2], discrete argmax anchor coordinates
+        predicted_goal_position: [B, K, 2], attention-weighted goal coordinates
         goal_FDE: [B, K]
         gt: [B, T, 5]  # (x, y, vx, vy, valid)
         center_gt_final_valid_idx: [B]
@@ -288,6 +291,10 @@ class Criterion(nn.Module):
         gt_goal = gt[b_idx, final_idx, :2]            # [B, 2]
         valid_final = gt[b_idx, final_idx, -1].float() # [B]
 
+        positive_goal_position = predicted_goal_position[b_idx, positive_goal_component]
+        position_loss_per_sample = torch.norm(positive_goal_position - gt_goal, p=2, dim=-1)
+        position_loss = (position_loss_per_sample * valid_final).sum() / valid_final.sum().clamp_min(1.0)
+
         # FDE is a detached quality target: it trains the ranking head without
         # leaking gradients into the proposed goal coordinates.
         final_goal_position = predicted_goal_position.detach()
@@ -298,7 +305,10 @@ class Criterion(nn.Module):
         else:
             disp_loss = goal_FDE.sum() * 0.0
 
-        return self.config.get('disp_weight', 1.0) * disp_loss
+        return (
+            self.config.get('goal_position_weight', self.config.get('goal_reg_weight', 1.0)) * position_loss
+            + self.config.get('disp_weight', 1.0) * disp_loss
+        )
     
     def get_state_query_loss(self, state_pred, gt):
         """

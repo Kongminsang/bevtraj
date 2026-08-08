@@ -338,6 +338,16 @@ class BaseDataset(Dataset):
                 'difficulty': [0],
                 'object_type': [MetaDriveType.VEHICLE]
             }
+            elif ret.get('dataset') == 'nuscenes':
+                if ret.get('tracks_to_predict', None) is None:
+                    raise ValueError(
+                        f"tracks_to_predict is required for scenario {ret['scenario_id']}"
+                    )
+                sample_list = list(dict.fromkeys(ret['tracks_to_predict'].keys()))
+                filtered_tracks = self.trajectory_filter(ret, candidate_ids=sample_list)
+                if len(filtered_tracks) == 0:
+                    continue
+                sample_list = list(filtered_tracks.keys())
             elif ret.get('tracks_to_predict', None) is None:
                 filtered_tracks = self.trajectory_filter(ret)
                 sample_list = list(filtered_tracks.keys())
@@ -1167,7 +1177,12 @@ class BaseDataset(Dataset):
 
         return sampled_array, sampled_indices
     
-    def trajectory_filter(self, data):
+    def trajectory_filter(self, data, candidate_ids=None):
+        if data.get('dataset') == 'nuscenes':
+            return self._trajectory_filter_nuscenes(data, candidate_ids)
+        return self._trajectory_filter_av2_sensor(data)
+
+    def _trajectory_filter_av2_sensor(self, data):
         """
         select multiple target agents based on their states
         """
@@ -1208,6 +1223,71 @@ class BaseDataset(Dataset):
         if len(tracks_to_predict) > self.config['target_per_scene']:
             sorted_tracks = sorted(tracks_to_predict.items(), key=lambda x: x[1]['dist_from_ego_avg'])
             tracks_to_predict = dict(sorted_tracks[:self.config['target_per_scene']])
+
+        return tracks_to_predict
+
+    def _trajectory_filter_nuscenes(self, data, candidate_ids=None):
+        """
+        Keep target agents whose valid trajectory stays inside the ego-current
+        BEV feature window.
+        """
+        trajs = data['track_infos']['trajs']
+        object_ids = data['track_infos']['object_id']
+        object_types = data['track_infos']['object_type']
+        current_idx = data['current_time_index']
+        sdc_track_idx = data['sdc_track_index']
+
+        target_bev_range = self.config.get('target_bev_range', 35.0)
+        if isinstance(target_bev_range, (list, tuple)):
+            target_bev_range_x, target_bev_range_y = target_bev_range[:2]
+        else:
+            target_bev_range_x = target_bev_range_y = target_bev_range
+        min_coverage = self.config.get('target_bev_min_coverage', 0.8)
+
+        valid_mask = trajs[:, :, -1] > 0
+        ego_current_xy = trajs[sdc_track_idx, current_idx, 0:2]
+        ego_current_yaw = trajs[sdc_track_idx, current_idx, 6]
+
+        rel_xy = trajs[:, :, 0:2] - ego_current_xy[None, None, :]
+        rel_xy = common_utils.rotate_points_along_z(
+            points=rel_xy.reshape(1, -1, 2),
+            angle=np.array([-ego_current_yaw])
+        ).reshape(trajs.shape[0], trajs.shape[1], 2)
+
+        inside_bev = (
+            (np.abs(rel_xy[:, :, 0]) <= target_bev_range_x) &
+            (np.abs(rel_xy[:, :, 1]) <= target_bev_range_y)
+        )
+        valid_count = valid_mask.sum(axis=1)
+        covered_count = (inside_bev & valid_mask).sum(axis=1)
+        coverage = np.divide(
+            covered_count,
+            valid_count,
+            out=np.zeros_like(covered_count, dtype=np.float32),
+            where=valid_count > 0
+        )
+
+        candidate_ids = set(object_ids if candidate_ids is None else candidate_ids)
+        selected_type = [object_type[x] for x in self.config['object_type']]
+        tracks_to_predict = {}
+        for idx, track_id in enumerate(object_ids):
+            if track_id not in candidate_ids:
+                continue
+            if track_id == data['sdc_id']:
+                continue
+            if object_types[idx] not in selected_type:
+                continue
+            if not valid_mask[idx, current_idx]:
+                continue
+            if coverage[idx] < min_coverage:
+                continue
+
+            tracks_to_predict[track_id] = {
+                'track_index': idx,
+                'track_id': track_id,
+                'object_type': object_types[idx],
+                'bev_coverage': coverage[idx],
+            }
 
         return tracks_to_predict
 

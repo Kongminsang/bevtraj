@@ -18,7 +18,6 @@ def evaluation(cfg):
     cfg = OmegaConf.merge(cfg, cfg.method)
     cfg['eval'] = True
 
-    cfg.MODEL.debug = cfg.debug
     model = build_model(cfg.MODEL)
 
     val_set = build_dataset(cfg.VAL_DATASET, val=True)
@@ -31,9 +30,9 @@ def evaluation(cfg):
 
     trainer = pl.Trainer(
         inference_mode=True,
-        logger=None if cfg.debug else WandbLogger(project="unitraj", name=cfg.exp_name),
+        logger=WandbLogger(project="unitraj", name=cfg.exp_name),
         devices=1,
-        accelerator="cpu" if cfg.debug else "gpu",
+        accelerator="gpu",
         profiler="simple",
     )
 

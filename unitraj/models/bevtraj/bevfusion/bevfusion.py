@@ -36,7 +36,6 @@ class BEVFusion(Base3DDetector):
         init_cfg: OptMultiConfig = None,
         weight_path: str = None,
         dataset_name: str = 'nusc',
-        bev_map_segmentation: bool = False,
         **kwargs,
     ) -> None:
         voxelize_cfg = data_preprocessor.pop('voxelize_cfg')
@@ -78,8 +77,7 @@ class BEVFusion(Base3DDetector):
         self.heads = nn.ModuleDict()
         for name in heads:
             if heads[name] is not None:
-                self.heads[name] = BEVSegmentationHead(**heads[name], 
-                        override_class=bev_map_segmentation, dataset_name=dataset_name)
+                self.heads[name] = BEVSegmentationHead(**heads[name])
 
         self.init_weights()
         
@@ -89,7 +87,6 @@ class BEVFusion(Base3DDetector):
             self.init_weights()
             
         self.dataset_name = dataset_name
-        self.bev_map_segmentation = bev_map_segmentation
             
     def _forward(self,
                  batch_inputs: Tensor,
@@ -397,8 +394,4 @@ class BEVFusion(Base3DDetector):
         if self.dataset_name == 'argo2':
             feats = torch.rot90(feats, k=1, dims=(2,3))
         
-        if self.bev_map_segmentation:
-            seg_loss = self.heads['map'].loss(feats, batch_data_samples)
-        else:
-            seg_loss = torch.tensor(0.0).to(feats.device)
-        return feats, seg_loss
+        return feats

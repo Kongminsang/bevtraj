@@ -4,10 +4,11 @@ exp_name: &exp_name 'bevtraj_av2sensor'
 
 # train
 
-max_epochs: &max_epochs 50
-train_batch_size: &train_batch_size 2
-eval_batch_size: &eval_batch_size 2
+max_epochs: &max_epochs 15
+train_batch_size: &train_batch_size 8
+eval_batch_size: &eval_batch_size 16
 grad_clip_norm: 5
+visualize_num: &visualize_num 40
 
 # model settings
 
@@ -31,6 +32,8 @@ MODEL:
     NAME: *model_name
     exp_name: *exp_name
     past_len: *past_len
+    visualize_num: *visualize_num
+    grid_size: &grid_size [51.2, 51.2]
 
     PRE_ENCODER:
         k_attr: 8
@@ -67,9 +70,6 @@ MODEL:
                     out_indices: [1, 2, 3]
                     with_cp: false
                     convert_weights: true
-                    init_cfg:
-                        type: Pretrained
-                        checkpoint: "https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth"
                 neck:
                     in_channels: [192, 384, 768]
                     out_channels: 256
@@ -157,7 +157,6 @@ MODEL:
                 loss_type: focal
                 use_grid_transform: true
         dataset_name: *dataset_name
-        bev_map_segmentation: false  # multi-task learning
         weight_path: pretraining_ckpt/bevfusion-seg.pth
     
     SCENE_CONTEXT_ENCODER:
@@ -171,10 +170,13 @@ MODEL:
         num_attn_head: 8
         dropout_of_attn: 0.1
 
-        bev_deformable_aggregation:
-            num_ba_query: 256
+        bda_enc:
+            num_ba_query: 512
             dropout: 0.1
-            grid_size: [51.2, 51.2]
+            grid_size: *grid_size
+            refine_share_param: true
+            use_anchor_points: true
+            anchor_file_name: 'cluster_64_center_dict_6s.pkl'
             num_bda_layers: 3
             bda_layer:
                 dropout: 0.1
@@ -187,6 +189,7 @@ MODEL:
     DECODER:
         past_len: *past_len
         future_len: *future_len
+        grid_size: *grid_size
 
         d_model: 256
         ffn_dims: 512
@@ -194,48 +197,94 @@ MODEL:
         T_dims: 32
 
         num_modes: 10
-        target_attr: 9
+        target_attr: &target_attr 9
         query_scale_dims: 256
-        tem_pos_T: 1000
-        spa_pos_T: 1000
+        mode_pos_T: 10000
+        spa_pos_T: 10000
 
         dropout: 0.1
         num_goal_proposal_layers: 2
-        num_decoder_layers: 6
+        goal_score_hidden_dim: 64
+        goal_agent_distance_threshold: 5.0
+        bev_path_softmin_temperature: 0.25
+        goal_path_time_stride: 5
+        goal_attn_temperature: 0.25
+        num_decoder_layers: 4
         num_heads: 16
-        score_time_stride_late_layers: 4
+        score_time_stride_late_layers: 1
         score_time_full_refine_layers: 1
+        refinement_smoothing_kernel_size: 7
+        refinement_smoothing_sigma: 2.5
+        goal_anchor_file_name: 'cluster_10mode_96anchors_detailed_6s.pkl'
+        trajectory_file_name: 'trajectory_set_256_60.pkl'
 
-        deform_cross_attn_key:
+        bda_dec:
+            past_len: *past_len
+            t_dims: 64
+            num_ba_query: 256
+            dropout: 0.1
+            grid_size: *grid_size
+            num_bda_layers: 3
+            target_attr: *target_attr
+            refine_share_param: true
+            anchor_file_name: 'cluster_256_center_dict_6s.pkl'
+            bda_layer:
+                dropout: 0.1
+                num_heads: 8
+                ffn_dims: 512
+                deform_attn:
+                    num_heads: 8
+                    num_key_points: 6
+
+        deform_cross_attn:
             dim_head: 64
             num_heads: 8
+            num_sampling_points: 12
             dropout: 0.1
-            downsample_factor: 4
-            offset_kernel_size: 6
-            group_key_values: true
-        deform_cross_attn_query:
+            grid_size: *grid_size
+            multi_range: true
+            time_scale_range: [1.0, 2.0]
+            offset_group_scales: [0.5, 1.0, 2.0]
+        deform_cross_attn_itr:
             dim_head: 64
             num_heads: 8
-            offset_groups: 16
+            num_sampling_points: 6
             dropout: 0.1
-            offset_scale: 8 # meter scale
-            x_bounds: [-51.2, 51.2]
-            y_bounds: [-51.2, 51.2]
+            grid_size: *grid_size
 
     loss:
-        goal_reg_loss_weight: 50.0
-        entropy_weight: 40.0
-        kl_weight: 20.0
-        use_FDEADE_aux_loss: true
-        traj_type_weight: false
-        dataset_name: *dataset_name
+        # SGCP goal and displacement loss
+        goal_position_weight: 1.0
+        disp_weight: 1.0
+        # SGCP anchor-distribution auxiliary loss
+        entropy_weight: 0.0
+        kl_weight: 1.0
+        goal_prob_sigma: 2.5
+        goal_prob_weight: 0.5
+        # decoder loss
+        cls_weight: 2.5
+        reg_weight: 4.0
+        vel_weight: 0.5
+        curvature_weight: 0.05
+        acc_weight: 0.001
+        jerk_weight: 0.00003
+        smoothness_dt: 0.1
+        state_query_weight: 0.25
+        dense_future_weight: 0.5
+        refinement_smoothing_sigma: 2.5
+        refinement_smoothing_weight: 0.3
+        # EDA
+        num_inter_layers: 2
+        distinct_anchors: false
+        distinct_nms_thresh: -1.0
+
     optimizer:
         lr: 0.0001
         weight_decay: 0.01
     scheduler:
         lr: 0.0001
-        min_lr: 5e-6
-        warmup_epochs: 5
+        min_lr: 1e-5
+        warmup_epochs: 3
         epochs: *max_epochs
 
 
@@ -257,8 +306,8 @@ trajectory_sample_interval: &trajectory_sample_interval 1
 multisample_per_scene: &multisample_per_scene true
 frame_skip_interval: &frame_skip_interval 6
 #map (only for visualization)
-ego_get_map_data: &ego_get_map_data false
-map_range: &map_range 100
+ego_get_map_data: &ego_get_map_data true
+map_range: &map_range 50
 max_num_roads: &max_num_roads 256
 max_points_per_lane: &max_points_per_lane 20
 manually_split_lane: &manually_split_lane false
@@ -266,7 +315,7 @@ point_sampled_interval: &point_sampled_interval 1
 num_points_each_polyline: &num_points_each_polyline 20
 vector_break_dist_thresh: &vector_break_dist_thresh 1.0
 line_type: &line_type [ 'lane','stop_sign','road_edge','road_line','crosswalk','speed_bump', ]
-center_offset_of_map: &center_offset_of_map [ 30.0, 0.0 ]
+center_offset_of_map: &center_offset_of_map [ 0.0, 0.0 ]
 
 # sensor_data
 

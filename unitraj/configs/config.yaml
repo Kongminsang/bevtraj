@@ -1,8 +1,8 @@
 # exp setting
 ckpt_path: null # checkpoint path, used for evaluation
+save_checkpoint: False # whether to save training checkpoints
 seed: 42 # random seed
-debug: False # debug mode, will use cpu only
-devices: [ 0 ] # gpu ids
+devices: [ 0, 1, 2, 3 ] # gpu ids
 eval: False
 
 # official evaluation

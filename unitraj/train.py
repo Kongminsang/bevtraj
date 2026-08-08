@@ -22,7 +22,6 @@ def train(cfg):
 
     save_config_as_txt(cfg)
 
-    cfg.MODEL.debug = cfg.debug
     model = build_model(cfg.MODEL)
     train_set = build_dataset(cfg.TRAIN_DATASET, val=False)
     val_set = build_dataset(cfg.VAL_DATASET, val=True)
@@ -32,16 +31,16 @@ def train(cfg):
 
     call_backs = []
 
-    checkpoint_callback = ModelCheckpoint(
-        dirpath='ckpt/' + cfg.exp_name,
-        # monitor='val/minADE5',
-        filename='{epoch}-{val/minADE5:.2f}',
-        save_top_k=-1,
-        mode='min',  # 'min' for loss/error, 'max' for accuracy
-        every_n_epochs=3,
-    )
-
-    call_backs.append(checkpoint_callback)
+    if cfg.save_checkpoint:
+        checkpoint_callback = ModelCheckpoint(
+            dirpath='ckpt/' + cfg.exp_name,
+            monitor='val/minADE5',
+            filename='{epoch}-{val/minADE5:.2f}',
+            save_top_k=3,
+            mode='min',  # 'min' for loss/error, 'max' for accuracy
+            every_n_epochs=1,
+        )
+        call_backs.append(checkpoint_callback)
 
     train_loader = DataLoader(
         train_set, batch_size=train_batch_size, num_workers=cfg.load_num_workers, drop_last=False,
@@ -53,18 +52,20 @@ def train(cfg):
 
     trainer = pl.Trainer(
         max_epochs=cfg.method.max_epochs,
-        logger=None if cfg.debug else WandbLogger(project="unitraj", name=cfg.exp_name, id=cfg.exp_name),
-        devices=1 if cfg.debug else cfg.devices,
+        logger=WandbLogger(project="unitraj", name=cfg.exp_name, id=cfg.exp_name),
+        devices=cfg.devices,
         gradient_clip_val=cfg.method.grad_clip_norm,
-        accelerator="cpu" if cfg.debug else "gpu",
+        accelerator="gpu",
         profiler="simple",
-        strategy="auto" if cfg.debug else "ddp_find_unused_parameters_true",
+        strategy="ddp_find_unused_parameters_true",
         callbacks=call_backs,
-        check_val_every_n_epoch=3,
+        check_val_every_n_epoch=1,
+        num_sanity_val_steps=0,
+        enable_checkpointing=cfg.save_checkpoint,
     )
 
     # automatically resume training
-    if cfg.ckpt_path is None and not cfg.debug:
+    if cfg.ckpt_path is None:
         cfg.ckpt_path = find_latest_checkpoint(os.path.join('ckpt', cfg.exp_name))
 
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=cfg.ckpt_path)
