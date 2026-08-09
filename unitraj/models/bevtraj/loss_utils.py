@@ -224,7 +224,7 @@ class Criterion(nn.Module):
         center_gt_final_valid_idx,
     ):
         """
-        predicted_goal_position: [B, K, 2], regressed goal coordinates
+        predicted_goal_position: [B, K, 2], attention-weighted goal coordinates
         goal_FDE: [B, K]
         gt: [B, T, 5]  # (x, y, vx, vy, valid)
         center_gt_final_valid_idx: [B]
