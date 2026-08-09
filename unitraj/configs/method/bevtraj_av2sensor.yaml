@@ -256,11 +256,6 @@ MODEL:
         # SGCP goal and displacement loss
         goal_position_weight: 1.0
         disp_weight: 1.0
-        # SGCP anchor-distribution auxiliary loss
-        entropy_weight: 0.0
-        kl_weight: 1.0
-        goal_prob_sigma: 2.5
-        goal_prob_weight: 0.5
         # decoder loss
         cls_weight: 2.5
         reg_weight: 4.0

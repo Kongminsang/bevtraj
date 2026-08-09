@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from unitraj.models.bevtraj.bev_deformable_aggregation import BDA_DEC
 from unitraj.models.bevtraj.decoder_deform_attn import BEVDeformCrossAttn
-from unitraj.models.bevtraj.linear import MLP, FFN, MotionClsHead, MotionRegHead, MotionVelHead
+from unitraj.models.bevtraj.linear import MLP, FFN, MotionRegHead, MotionVelHead
 from unitraj.models.bevtraj.temporal_sequential_module import TemporalMHA, TemporalMHA_NoTimePE
 from unitraj.models.bevtraj.utility import gen_sineembed_for_position, target_to_ego
 
@@ -274,7 +274,7 @@ class BEVTrajDecoder(nn.Module):
         self.bev_cross_attn_l1 = BEVDeformCrossAttn(**self.dca_cfg)
         self.ffn_l1 = FFN(self.D, self.ffn_D, 2)
         
-        self.mode_prob_head_l1 = MotionClsHead(self.D, self.T_D, self.T)
+        self.mode_prob_head_l1 = MLP(self.D, self.D, 1, 2)
         self.motion_reg_l1 = MotionRegHead(self.D)
         self.motion_vel_l1 = MotionVelHead(self.D)
 
@@ -319,7 +319,7 @@ class BEVTrajDecoder(nn.Module):
         dec_layer = BEVTrajDecoderLayer(self.dec_layer_config)
         self.dec_layers = nn.ModuleList([copy.deepcopy(dec_layer) for _ in range(self.L_dec - 1)])
         
-        self.mode_prob_head = MotionClsHead(self.D, self.T_D, self.T)
+        self.mode_prob_head = MLP(self.D, self.D, 1, 2)
         self.motion_reg = MotionRegHead(self.D)
         self.motion_vel = MotionVelHead(self.D)
         self.refinement_smoothing_sigma_head = nn.Linear(self.D, 1)
@@ -736,7 +736,19 @@ class BEVTrajDecoder(nn.Module):
         # ===================== trajectory prediction =====================
         out_dist = self.motion_reg_l1(dec_embed_T)  # [M,B,T,5]
         out_vel = self.motion_vel_l1(dec_embed_T)  # [M,B,T,2]
-        mode_prob = self.mode_prob_head_l1(dec_embed_T).squeeze(dim=-1).T
+        mode_prob = self.score_predicted_trajectory(
+            dec_embed=dec_embed_T,
+            pred_traj=out_dist,
+            pred_vel=out_vel,
+            bev_feat=bev_feat,
+            ego_dyn=ego_dyn,
+            tc_dyn=tc_dyn,
+            scene_context=scene_context_tokens,
+            dense_future_pred=dense_future_pred,
+            obj_valid_mask=obj_valid_mask,
+            target_idx=target_idx,
+            mode_prob_head=self.mode_prob_head_l1,
+        )
 
         return dec_embed_T, mode_prob, out_dist, out_vel, state_pred
 
@@ -800,7 +812,8 @@ class BEVTrajDecoder(nn.Module):
 
         # exp: temporal PE (time_embedding_mlp)
         time_pe = self.build_time_pe(B, num_modes, dec_embed.dtype)
-        for layer in self.dec_layers:
+        late_score_time_indices = self.get_late_score_time_indices(dec_embed.device)
+        for layer_idx, layer in enumerate(self.dec_layers):
             query_scale = self.get_query_scale_itr(dec_embed)
             dec_embed = layer(
                 dec_embed=dec_embed,
@@ -824,7 +837,23 @@ class BEVTrajDecoder(nn.Module):
             ref_points = pred_xy.detach().clone()
 
             pred_vel = self.motion_vel(dec_embed) # [K, B, T, 2]
-            mode_prob = self.mode_prob_head(dec_embed).squeeze(dim=-1).T
+            score_time_indices = None
+            if layer_idx >= self.score_time_full_refine_layers:
+                score_time_indices = late_score_time_indices
+            mode_prob = self.score_predicted_trajectory(
+                dec_embed=dec_embed,
+                pred_traj=pred_traj,
+                pred_vel=pred_vel,
+                bev_feat=bev_feat,
+                ego_dyn=ego_dyn,
+                tc_dyn=tc_dyn,
+                scene_context=scene_context_tokens,
+                dense_future_pred=dense_future_pred,
+                obj_valid_mask=obj_valid_mask,
+                target_idx=target_idx,
+                mode_prob_head=self.mode_prob_head,
+                time_indices=score_time_indices,
+            )
 
             pred_traj = pred_traj.permute(0, 2, 1, 3).contiguous()
             pred_vel = pred_vel.permute(0, 2, 1, 3).contiguous()
