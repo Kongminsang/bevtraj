@@ -53,7 +53,6 @@ class Criterion(nn.Module):
         pred_vels = out['predicted_velocity'] # [K, T, B, 2]
 
         predicted_goal_position = out['predicted_goal_position']
-        goal_cluster_centroids = out['goal_cluster_centroids']
         goal_FDE = out['predicted_goal_FDE']
 
         dense_future_pred = out['dense_future_pred']
@@ -65,9 +64,7 @@ class Criterion(nn.Module):
 
         b_idx = torch.arange(gt_decoder.size(0), device=gt_decoder.device)
         gt_goal = gt_decoder[b_idx, center_gt_final_valid_idx.long(), :2]
-        positive_goal_component = (
-            goal_cluster_centroids[None] - gt_goal[:, None]
-        ).norm(dim=-1).argmin(dim=-1)
+        positive_goal_component = (predicted_goal_position.detach() - gt_goal[:, None]).norm(dim=-1).argmin(dim=-1)
         
         decoder_loss = self.get_decoder_loss_hard_assign(
             modes_preds=modes_preds,

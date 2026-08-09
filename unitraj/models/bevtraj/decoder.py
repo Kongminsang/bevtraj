@@ -172,7 +172,6 @@ class BEVTrajDecoder(nn.Module):
         self.dropout = config['dropout']
         self.L_goal_proposal = config['num_goal_proposal_layers']
         self.goal_score_hidden_dim = int(config.get('goal_score_hidden_dim', max(self.D // 4, 32)))
-        self.goal_agent_distance_threshold = float(config.get('goal_agent_distance_threshold', 5.0))
         self.bev_path_softmin_temperature = float(config.get('bev_path_softmin_temperature', 0.5))
         self.L_dec = config['num_decoder_layers']
         self.num_heads = config['num_heads']
@@ -208,22 +207,6 @@ class BEVTrajDecoder(nn.Module):
         # ============================ Goal Candidate Proposal==========================
 
         self.bda_sgcp = BDA_DEC(self.config['bda_dec'], self.D)
-
-        self.goal_anchor_file_name = config['goal_anchor_file_name']
-        file_path = ASSET_DIR / self.goal_anchor_file_name
-        with open(file_path, 'rb') as f:
-            goal_anchor_data = pickle.load(f)['VEHICLE']
-        goal_anchor_indices = torch.as_tensor(goal_anchor_data['anchor_indices'], dtype=torch.long)
-        goal_cluster_centroids = torch.as_tensor(goal_anchor_data['centroids'], dtype=torch.float32)
-        if goal_anchor_indices.size(0) != self.K or goal_cluster_centroids.shape != (self.K, 2):
-            raise ValueError(
-                f'{self.goal_anchor_file_name} must contain {self.K} anchor clusters and centroids'
-            )
-        goal_attn_mask = torch.ones(self.K, self.bda_sgcp.anchors.size(0), dtype=torch.bool)
-        goal_attn_mask.scatter_(1, goal_anchor_indices, False)
-        self.register_buffer('goal_attn_mask', goal_attn_mask, persistent=False)
-        self.register_buffer('goal_anchor_indices', goal_anchor_indices, persistent=False)
-        self.register_buffer('goal_cluster_centroids', goal_cluster_centroids, persistent=False)
 
         self.goal_query = nn.Parameter(torch.empty(self.K, 1, self.D))
         nn.init.xavier_uniform_(self.goal_query)
@@ -391,25 +374,11 @@ class BEVTrajDecoder(nn.Module):
         motion_context = self.goal_motion_pool(torch.cat([motion_tokens[:, -1], attended_motion], dim=-1))[None]
         learned_query = self.goal_motion_conditioner(self.goal_query.expand(-1, B, -1), motion_context)
 
-        history_pos = agent_history['positions'].float()
-        history_valid = agent_history['valid_mask'].bool()
-        cluster_anchors = self.bda_sgcp.anchors[self.goal_anchor_indices].float()
-        threshold_sq = self.goal_agent_distance_threshold ** 2
-        agents_in_mode = []
-        for mode_anchors in cluster_anchors:
-            distance_sq = (history_pos.unsqueeze(-2) - mode_anchors).square().sum(dim=-1)
-            agents_in_mode.append(((distance_sq.amin(dim=-1) <= threshold_sq) & history_valid).any(dim=-1))
-        agents_in_mode = torch.stack(agents_in_mode, dim=1)
-        agents_in_mode[batch_idx, :, target_idx] = True
-        scene_attn_mask = (~agents_in_mode)[:, None].expand(-1, self.num_heads, -1, -1)
-        scene_attn_mask = scene_attn_mask.reshape(B * self.num_heads, self.K, scene_context.size(0))
-
         mode_query = self.goal_scene_norm(
             self.goal_scene_cross_attn(
                 learned_query,
                 scene_context,
                 scene_context,
-                attn_mask=scene_attn_mask,
                 key_padding_mask=scene_key_padding_mask,
                 need_weights=False,
             )[0] + learned_query
@@ -424,7 +393,6 @@ class BEVTrajDecoder(nn.Module):
                 query=cross_query,
                 key=bda_key,
                 value=bda_value,
-                attn_mask=self.goal_attn_mask,
                 need_weights=False,
             )[0]
             mode_query = layer['norm2'](layer['q_proj'](cross_query) + mode_query)
@@ -837,7 +805,6 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_trajectory': pred_trajs,
                   'predicted_velocity': pred_vels,
                   'predicted_goal_position': predicted_goal_position,
-                  'goal_cluster_centroids': self.goal_cluster_centroids,
                   'predicted_goal_FDE': goal_FDE,
                   'refinement_smoothing_sigma': torch.stack(refinement_smoothing_sigmas),
                 #   'init_top_idx': init_top_idx,                # [B, K]
