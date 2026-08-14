@@ -156,6 +156,11 @@ class BDA_ENC(BEVDeformableAggregation):
             with open(file_path, 'rb') as f:
                 anchors = pickle.load(f)
             self.register_buffer('anchors', torch.from_numpy(anchors['VEHICLE']).float())
+            if self.num_ba_query != self.anchors.shape[0]:
+                raise ValueError(
+                    'num_ba_query must match the number of anchors when '
+                    f'use_anchor_points=True: {self.num_ba_query} != {self.anchors.shape[0]}'
+                )
         else:
             self.ref_pos = nn.Parameter(self.create_uniform_2d_grid_tensor(self.num_ba_query), requires_grad=True)
 
@@ -211,9 +216,8 @@ class BDA_ENC(BEVDeformableAggregation):
             B, A, _ = obj_pos.shape
             K = self.anchors.shape[0]
             
-            anchor_pos = self.anchors[None, None, :, :]
-            anchor_pos = anchor_pos.repeat(B, A, 1, 1)
-            ref_pos_target = self.place_template_points(anchor_pos, obj_pos, obj_heading).reshape(B, A*K, 2) # (B, 256, 2)
+            anchor_pos = self.anchors[None, None, :, :].expand(B, A, K, 2)
+            ref_pos_target = self.place_template_points(anchor_pos, obj_pos, obj_heading).reshape(B, A*K, 2)
 
             trans_x, trans_y, rot_sin, rot_cos = (
                 ego_dyn['ego_x'],
@@ -223,13 +227,18 @@ class BDA_ENC(BEVDeformableAggregation):
             )
             ref_pos = target_to_ego(ref_pos_target, trans_x, trans_y, rot_sin, rot_cos)
             ref_pos_norm = ref_pos / self.denorm_scale[None, None, :]
+            output = (
+                self.ba_query[None, None, :, :]
+                .expand(B, A, K, self.D)
+                .reshape(B, A * K, self.D)
+            )
         else:
             B = bev_feat.shape[0]
             ref_pos_norm = self.ref_pos[None].repeat(B, 1, 1)
             ref_pos = ref_pos_norm * self.denorm_scale[None, None, :]
-        
+            output = self.ba_query[None].repeat(B, 1, 1)
+
         # BEV Deformable Aggregation
-        output = self.ba_query[None].repeat(B, 1, 1)
         query_sine_embed = gen_sineembed_for_position(ref_pos, hidden_dim=self.D, temperature=10000)
         pos_q = self.query_pos(query_sine_embed)
 

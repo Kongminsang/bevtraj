@@ -171,7 +171,7 @@ MODEL:
         dropout_of_attn: 0.1
 
         bda_enc:
-            num_ba_query: 512
+            num_ba_query: 64
             dropout: 0.1
             grid_size: *grid_size
             refine_share_param: true
