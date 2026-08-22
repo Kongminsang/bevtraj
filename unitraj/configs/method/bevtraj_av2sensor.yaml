@@ -294,6 +294,8 @@ object_type: &object_type ['VEHICLE']
 masked_attributes: &masked_attributes ['z_axis']
 only_train_on_ego: &only_train_on_ego false
 target_per_scene: &target_per_scene 4
+target_bev_range: &target_bev_range 30.0
+target_bev_min_coverage: &target_bev_min_coverage 0.8
 use_cache: &use_cache false
 overwrite_cache: &overwrite_cache true
 store_data_in_memory: &store_data_in_memory false
@@ -523,6 +525,8 @@ TRAIN_DATASET:
         masked_attributes: *masked_attributes
         only_train_on_ego: *only_train_on_ego
         target_per_scene: *target_per_scene
+        target_bev_range: *target_bev_range
+        target_bev_min_coverage: *target_bev_min_coverage
         use_cache: *use_cache 
         overwrite_cache: *overwrite_cache 
         store_data_in_memory: *store_data_in_memory
@@ -569,6 +573,8 @@ VAL_DATASET:
         masked_attributes: *masked_attributes
         only_train_on_ego: *only_train_on_ego
         target_per_scene: *target_per_scene
+        target_bev_range: *target_bev_range
+        target_bev_min_coverage: *target_bev_min_coverage
         use_cache: *use_cache
         overwrite_cache: *overwrite_cache
         store_data_in_memory: *store_data_in_memory

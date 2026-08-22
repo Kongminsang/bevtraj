@@ -391,7 +391,8 @@ class BaseDataset(Dataset):
                 current_time_index=current_time_index,
                 obj_types=obj_types, scene_id=scene_id
             )
-            if center_objects is None: return None
+            if center_objects is None:
+                continue
 
             sample_num = center_objects.shape[0]
 
@@ -705,7 +706,6 @@ class BaseDataset(Dataset):
             center_objects_list.append(obj_trajs_full[obj_idx, current_time_index])
             track_index_to_predict_selected.append(obj_idx)
         if len(center_objects_list) == 0:
-            print(f'Warning: no center objects at time step {current_time_index}, scene_id={scene_id}')
             return None, []
         center_objects = np.stack(center_objects_list, axis=0)  # (num_center_objects, num_attrs)
         track_index_to_predict = np.array(track_index_to_predict_selected)
@@ -1190,10 +1190,38 @@ class BaseDataset(Dataset):
         current_idx = data['current_time_index']
         obj_summary = data['object_summary']
         sdc_track_idx = data['sdc_track_index']
+
+        target_bev_range = self.config.get('target_bev_range', 35.0)
+        if isinstance(target_bev_range, (list, tuple)):
+            target_bev_range_x, target_bev_range_y = target_bev_range[:2]
+        else:
+            target_bev_range_x = target_bev_range_y = target_bev_range
+        min_coverage = self.config.get('target_bev_min_coverage', 0.8)
         
         # calculate distance from ego vehicle
         N = trajs.shape[0]
         valid_mask = trajs[:, :, -1]
+
+        ego_current_xy = trajs[sdc_track_idx, current_idx, 0:2]
+        ego_current_yaw = trajs[sdc_track_idx, current_idx, 6]
+        rel_xy = trajs[:, :, 0:2] - ego_current_xy[None, None, :]
+        rel_xy = common_utils.rotate_points_along_z(
+            points=rel_xy.reshape(1, -1, 2),
+            angle=np.array([-ego_current_yaw])
+        ).reshape(trajs.shape[0], trajs.shape[1], 2)
+        inside_bev = (
+            (np.abs(rel_xy[:, :, 0]) <= target_bev_range_x) &
+            (np.abs(rel_xy[:, :, 1]) <= target_bev_range_y)
+        )
+        bev_valid_mask = valid_mask > 0
+        bev_valid_count = bev_valid_mask.sum(axis=1)
+        covered_count = (inside_bev & bev_valid_mask).sum(axis=1)
+        coverage = np.divide(
+            covered_count,
+            bev_valid_count,
+            out=np.zeros_like(covered_count, dtype=np.float32),
+            where=bev_valid_count > 0
+        )
         
         ego_pos = np.tile(trajs[sdc_track_idx, :, 0:2], (N, 1, 1))
         trajs_ego_centric = (trajs[:, :, 0:2] - ego_pos) * valid_mask[..., None]
@@ -1216,9 +1244,10 @@ class BaseDataset(Dataset):
             if moving_distance < 4.0 and type=='VEHICLE': continue
             is_valid_at_m = validity[current_idx]>0
             if not is_valid_at_m: continue
+            if coverage[idx] < min_coverage: continue
 
             tracks_to_predict[k] = {'track_index': idx, 'track_id': k, 'difficulty': 0, \
-                'object_type': type, 'dist_from_ego_avg': dist_from_ego_avg[idx]}
+                'object_type': type, 'dist_from_ego_avg': dist_from_ego_avg[idx], 'bev_coverage': coverage[idx]}
             
         if len(tracks_to_predict) > self.config['target_per_scene']:
             sorted_tracks = sorted(tracks_to_predict.items(), key=lambda x: x[1]['dist_from_ego_avg'])
