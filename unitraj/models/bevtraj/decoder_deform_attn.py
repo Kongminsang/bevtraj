@@ -8,50 +8,8 @@ from unitraj.models.bevtraj.linear import MLP
 
 # helper functions
 
-def exists(val):
-    return val is not None
-
-def default(val, d):
-    return val if exists(val) else d
-
 def divisible_by(numer, denom):
     return (numer % denom) == 0
-
-# tensor helpers
-
-def create_grid_like(t, dim = 0):
-    h, w, device = *t.shape[-2:], t.device
-
-    grid = torch.stack(torch.meshgrid(
-        torch.arange(w, device = device),
-        torch.arange(h, device = device),
-    indexing = 'xy'), dim = dim)
-
-    grid.requires_grad = False
-    grid = grid.type_as(t)
-    return grid
-
-def normalize_grid(grid, w, h, dim = 1, out_dim = -1, ref_from_Q=False):
-    # normalizes a grid to range from -1 to 1
-    grid_w, grid_h = grid.unbind(dim = dim) # grid_w: x, grid_h: y
-    
-    if ref_from_Q:
-        grid_w = 2.0 * grid_w / max(w, 1)
-        grid_h = 2.0 * grid_h / max(h, 1)
-    else:
-        grid_w = 2.0 * grid_w / max(w - 1, 1) - 1.0
-        grid_h = 2.0 * grid_h / max(h - 1, 1) - 1.0
-
-    return torch.stack((grid_w, grid_h), dim = out_dim) # grid_w: x, grid_h: y
-
-class Scale(nn.Module):
-    def __init__(self, scale):
-        super().__init__()
-        self.scale = scale
-
-    def forward(self, x):
-        return x * self.scale
-
     
 # main class
 

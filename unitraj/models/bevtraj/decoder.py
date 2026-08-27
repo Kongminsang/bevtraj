@@ -66,17 +66,8 @@ class BEVTrajDecoderLayer(nn.Module):
         self.ffn = FFN(self.D, self.ffn_D, 2)
     
     def forward(self, dec_embed, scene_context, bev_feat, query_scale, ref_points, ego_dyn, time_pe):
-        '''
-        Args:
-            dec_embed: [T, B*K, D]
-            scene_context: [t, B, D]
-            bev_feat: [B, D, H, W]
-            query_scale: [T, B*K, d]
-            ref_points: [K, B, T, 2]
-        '''
         B = bev_feat.size(0)
         num_modes = ref_points.size(0)
-        scene_context = scene_context 
         
         # ============================== target-centric(tc) modeling ==============================
         temp_out = self.temp_self_attn(dec_embed, time_pe)
@@ -807,10 +798,6 @@ class BEVTrajDecoder(nn.Module):
 
         dec_embed = dec_embed.permute(2, 1, 0, 3).reshape(self.T, B * num_modes, -1)
 
-        # exp: sample-conditioned deterministic code
-        # dec_embed = self.temp_pos_enc(dec_embed)
-
-        # exp: temporal PE (time_embedding_mlp)
         time_pe = self.build_time_pe(B, num_modes, dec_embed.dtype)
         late_score_time_indices = self.get_late_score_time_indices(dec_embed.device)
         for layer_idx, layer in enumerate(self.dec_layers):
@@ -870,8 +857,7 @@ class BEVTrajDecoder(nn.Module):
                   'predicted_goal_position': predicted_goal_position,
                   'predicted_goal_FDE': goal_FDE,
                   'refinement_smoothing_sigma': torch.stack(refinement_smoothing_sigmas),
-                #   'init_top_idx': init_top_idx,                # [B, K]
-                  'state_pred': state_pred, # [B, T, 2]
+                  'state_pred': state_pred,
                 }
         return output
     

@@ -174,7 +174,6 @@ MODEL:
             num_ba_query: 64
             dropout: 0.1
             grid_size: *grid_size
-            refine_share_param: true
             use_anchor_points: true
             anchor_file_name: 'cluster_64_center_dict_6s.pkl'
             num_bda_layers: 3
@@ -226,7 +225,6 @@ MODEL:
             grid_size: *grid_size
             num_bda_layers: 3
             target_attr: *target_attr
-            refine_share_param: true
             anchor_file_name: 'cluster_256_center_dict_6s.pkl'
             bda_layer:
                 dropout: 0.1

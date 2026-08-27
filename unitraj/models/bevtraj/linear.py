@@ -79,11 +79,6 @@ def init(module, weight_init, bias_init, gain=1):
 
 
 class MotionRegHead(nn.Module):
-    '''
-    This class operates on the output of AutoBot-Ego's decoder representation. It produces the parameters of a
-    bivariate Gaussian distribution.
-    '''
-
     def __init__(self, D=64):
         super().__init__()
         self.D = D

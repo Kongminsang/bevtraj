@@ -133,7 +133,6 @@ class BEVDeformableAggregation(nn.Module, ABC):
         self.dropout = config['dropout']
         self.num_ba_query = config['num_ba_query']
         self.grid_size = config['grid_size']
-        self.refine_share_param = config['refine_share_param']
         
         self.ba_query = nn.Parameter(torch.zeros(self.num_ba_query, self.D), requires_grad=True)
             

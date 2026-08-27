@@ -116,7 +116,7 @@ class BEVTraj(BaseModel):
         target_idx = traj_data['track_index_to_predict']
         ego_idx = traj_data['ego_index']
         
-        # (target_agnet-centric) target agent dynamics
+        # (target_agent-centric) target agent dynamics
         tc_indices = [0, 1, -4, -3, -2, -1, 3, 4, 5]
         target_agent_dynamics = agents_in[B_idx, target_idx, ...][..., tc_indices] # (B, t, 9)
         

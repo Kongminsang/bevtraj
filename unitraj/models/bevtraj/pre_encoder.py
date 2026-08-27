@@ -65,10 +65,6 @@ class BEVTrajPreEncoder(nn.Module):
         self.social_attn_layers = nn.ModuleList(self.social_attn_layers)
 
     def process_observations(self, target, agents):
-        '''
-        :param observations: (B, T, N+2, A+1) where N+2 is [target, other_agents, env]
-        :return: a tensor of only the agent dynamic states, active_agent masks and env masks.
-        '''
         # target stuff
         target_tensor = target[:, :, :self.k_attr]
 
