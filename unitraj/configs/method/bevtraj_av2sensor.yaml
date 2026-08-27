@@ -4,7 +4,7 @@ exp_name: &exp_name 'bevtraj_av2sensor'
 
 # train
 
-max_epochs: &max_epochs 15
+max_epochs: &max_epochs 10
 train_batch_size: &train_batch_size 8
 eval_batch_size: &eval_batch_size 16
 grad_clip_norm: 5
@@ -279,7 +279,7 @@ MODEL:
     scheduler:
         lr: 0.0001
         min_lr: 1e-5
-        warmup_epochs: 3
+        warmup_epochs: 2
         epochs: *max_epochs
 
 
