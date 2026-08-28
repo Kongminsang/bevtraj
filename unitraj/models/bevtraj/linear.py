@@ -26,6 +26,16 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
+
+
+class GatedFusion(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gate = MLP(dim * 2, dim, 2, 2)
+
+    def forward(self, bev_feature, interaction_feature):
+        gate = self.gate(torch.cat([bev_feature, interaction_feature], dim=-1)).softmax(dim=-1)
+        return gate[..., :1] * bev_feature + gate[..., 1:] * interaction_feature
     
 
 class LayerScale(nn.Module):

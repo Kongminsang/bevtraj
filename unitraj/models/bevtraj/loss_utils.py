@@ -56,6 +56,7 @@ class Criterion(nn.Module):
         goal_FDE = out['predicted_goal_FDE']
 
         dense_future_pred = out['dense_future_pred']
+        dense_future_goal = out['dense_future_goal']
 
         state_pred = out['state_pred']
 
@@ -86,7 +87,9 @@ class Criterion(nn.Module):
 
         state_query_loss = self.get_state_query_loss(state_pred=state_pred, gt=gt_decoder)
 
-        dense_future_loss = self.get_dense_future_prediction_loss(dense_future_pred, gt_dense_future_trajs)
+        dense_future_loss = self.get_dense_future_prediction_loss(
+            dense_future_pred, dense_future_goal, gt_dense_future_trajs
+        )
 
         refinement_smoothing_loss = (
             out['refinement_smoothing_sigma'] - self.refinement_smoothing_sigma
@@ -270,9 +273,10 @@ class Criterion(nn.Module):
         w = float(self.config.get('state_query_weight', 1.0))
         return w * loss_xy
 
-    def get_dense_future_prediction_loss(self, prediction, gt):
-        obj_trajs_future_state = gt['obj_trajs_future_state']
-        obj_trajs_future_mask = gt['obj_trajs_future_mask']
+    def get_dense_future_prediction_loss(self, prediction, predicted_goal, gt):
+        num_objects = prediction.size(1)
+        obj_trajs_future_state = gt['obj_trajs_future_state'][:, :num_objects]
+        obj_trajs_future_mask = gt['obj_trajs_future_mask'][:, :num_objects]
         pred_dense_trajs = prediction  # (num_center_objects, num_objects, num_future_frames, 7)
         assert pred_dense_trajs.shape[-1] == 7
         assert obj_trajs_future_state.shape[-1] == 4
@@ -309,8 +313,24 @@ class Criterion(nn.Module):
         loss_reg = (loss_reg * obj_valid_mask.float()).sum(dim=-1) / valid_objects
         loss_reg = loss_reg.mean()
 
-        w = float(self.config.get('dense_future_weight', 0.5))
-        return w * loss_reg
+        time_idx = torch.arange(num_timestamps, device=prediction.device)
+        final_idx = (obj_trajs_future_mask.long() * time_idx).amax(dim=-1)
+        batch_idx = torch.arange(num_center_objects, device=prediction.device)[:, None]
+        object_idx = torch.arange(num_objects, device=prediction.device)[None]
+        gt_goal = obj_trajs_future_state[batch_idx, object_idx, final_idx, :2]
+        goal_loss = F.smooth_l1_loss(predicted_goal, gt_goal, reduction='none').sum(dim=-1)
+        goal_loss = (goal_loss * obj_valid_mask).sum() / obj_valid_mask.sum().clamp_min(1)
+
+        dense_xy = pred_dense_trajs[..., :2].reshape(-1, num_timestamps, 2)
+        dense_mask = obj_trajs_future_mask.reshape(-1, num_timestamps)
+        loss_acc, loss_jerk, loss_curvature = self.get_trajectory_smoothness_loss(dense_xy, dense_mask)
+        smoothness_loss = (
+            float(self.config.get('dense_acc_weight', self.config.get('acc_weight', 0.0))) * loss_acc
+            + float(self.config.get('dense_jerk_weight', self.config.get('jerk_weight', 0.0))) * loss_jerk
+            + float(self.config.get('dense_curvature_weight', self.config.get('curvature_weight', 0.0))) * loss_curvature
+        )
+        goal_loss = float(self.config.get('dense_goal_weight', 1.0)) * goal_loss
+        return float(self.config.get('dense_future_weight', 0.5)) * (loss_reg + goal_loss + smoothness_loss)
     
     def nll_loss_gmm_direct(
         self,

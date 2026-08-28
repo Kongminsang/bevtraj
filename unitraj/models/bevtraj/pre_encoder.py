@@ -63,6 +63,13 @@ class BEVTrajPreEncoder(nn.Module):
 
         self.temporal_attn_layers = nn.ModuleList(self.temporal_attn_layers)
         self.social_attn_layers = nn.ModuleList(self.social_attn_layers)
+        self.history_attn = nn.MultiheadAttention(self.D, self.num_heads, dropout=self.dropout, batch_first=True)
+        self.history_norm = nn.LayerNorm(self.D)
+        self.history_ffn = nn.Sequential(
+            nn.Linear(self.D, self.tx_hidden_size), nn.GELU(), nn.Dropout(self.dropout),
+            nn.Linear(self.tx_hidden_size, self.D), nn.Dropout(self.dropout)
+        )
+        self.history_ffn_norm = nn.LayerNorm(self.D)
 
     def process_observations(self, target, agents):
         # target stuff
@@ -129,16 +136,26 @@ class BEVTrajPreEncoder(nn.Module):
         :param target_in: [B, T_obs, k_attr+1] with last values being the existence mask.
         :param agents_in: [B, T_obs, num_agents, k_attr+1] with last values being the existence mask.
         :return:
-            pre_encoder_emb: shape [B, num_agents, T_obs, D]
+            pre_encoder_emb: shape [B, num_agents, D]
         '''
         target_tensor, _agents_tensor, opps_masks = self.process_observations(target_in, agents_in)
         agents_tensor = torch.cat((target_tensor.unsqueeze(2), _agents_tensor), dim=2)
         
+        agent_valid_mask = ~opps_masks[:, :, 1:].all(dim=1)
         agents_emb = self.agents_dynamic_encoder(agents_tensor).permute(1, 0, 2, 3)
         for i in range(self.L_enc):
             agents_emb = self.temporal_attn_fn(agents_emb, opps_masks, layer=self.temporal_attn_layers[i])
             agents_emb = self.social_attn_fn(agents_emb, opps_masks, layer=self.social_attn_layers[i])
 
-        pre_encoder_emb = agents_emb[:, :, 1:, :].permute(1, 2, 0, 3)
-        
-        return pre_encoder_emb
+        history = agents_emb[:, :, 1:, :].permute(1, 2, 0, 3)
+        B, N, T, D = history.shape
+        history = history.reshape(B * N, T, D)
+        history_padding_mask = opps_masks[:, :, 1:].permute(0, 2, 1).reshape(B * N, T).clone()
+        history_padding_mask[history_padding_mask.all(dim=-1), -1] = False
+        last_history = history[:, -1:]
+        agent_feature = self.history_norm(
+            self.history_attn(last_history, history, history, key_padding_mask=history_padding_mask, need_weights=False)[0]
+            + last_history
+        )
+        agent_feature = self.history_ffn_norm(self.history_ffn(agent_feature) + agent_feature).reshape(B, N, D)
+        return agent_feature * agent_valid_mask.unsqueeze(-1)

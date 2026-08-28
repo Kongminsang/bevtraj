@@ -27,10 +27,11 @@ class DeformAttn(nn.Module):
         self.attn_weights = build_mlp(self.D * 2, self.D, self.n_heads * self.n_points, dropout=0.0)
         self.value_proj = nn.Conv2d(self.head_dims, self.head_dims, kernel_size=1)
         self.output_proj = build_mlp(self.D * 2, self.D, self.D, dropout=0.0)
+        self.value_output_proj = build_mlp(self.D, self.D, self.D, dropout=0.0)
         
         self.register_buffer('offset_normalizer', torch.tensor(grid_size, dtype=torch.float32))
         
-    def forward(self, query_content, query_pos, ref_pos, bev_feat):
+    def forward(self, query_content, query_pos, ref_pos, bev_feat, value_only=False):
         B, _, H, W = bev_feat.shape
         N = query_content.shape[1]
 
@@ -53,7 +54,9 @@ class DeformAttn(nn.Module):
         attn_outputs = torch.sum(sampled_feature * attn_weights, dim=3)
         attn_outputs = attn_outputs.permute(0, 2, 1, 3).reshape(B, N, -1)
 
-        output = self.output_proj(torch.cat([attn_outputs, query_content], dim=-1))
+        output = self.value_output_proj(attn_outputs) if value_only else self.output_proj(
+            torch.cat([attn_outputs, query_content], dim=-1)
+        )
         return output
         
 
@@ -85,13 +88,13 @@ class BDALayer_ENC(BDALayer):
     def __init__(self, config, d_model, grid_size):
         super(BDALayer_ENC, self).__init__(config, d_model, grid_size)
 
-    def forward(self, ba_query, query_pos, ref_pos, bev_feat):
+    def forward(self, ba_query, query_pos, ref_pos, bev_feat, final_layer=False):
         tgt = self.with_pos_embed(ba_query, query_pos)
         tgt, _ = self.self_attn(tgt, tgt, ba_query)
         tgt = self.norm_layers[0](ba_query + self.dropout_layers[0](tgt))
         
-        tgt2 = self.cross_attn(tgt, query_pos, ref_pos, bev_feat)
-        tgt2 = self.norm_layers[1](tgt + self.dropout_layers[1](tgt2))
+        tgt2 = self.cross_attn(tgt, query_pos, ref_pos, bev_feat, value_only=final_layer)
+        tgt2 = self.norm_layers[1](tgt2 if final_layer else tgt + self.dropout_layers[1](tgt2))
         
         output = self.norm_layers[2](self.ffn(tgt2))
         return output
@@ -104,7 +107,7 @@ class BDALayer_DEC(BDALayer):
         self.pos_scale = build_mlp(self.D, self.D, self.D, dropout=self.dropout)
         self.query_pos = build_mlp(self.D, self.D, self.D, dropout=self.dropout)
     
-    def forward(self, ba_query, query_sine_embed, ref_pos, bev_feat, lid):
+    def forward(self, ba_query, query_sine_embed, ref_pos, bev_feat, lid, final_layer=False):
         # Self-Attention
         pos_scale = self.pos_scale(ba_query) if lid != 0 else 1
         self_query_pos = pos_scale * self.query_pos(query_sine_embed)
@@ -117,8 +120,8 @@ class BDALayer_DEC(BDALayer):
         cross_pos_scale = self.pos_scale(tgt)
         cross_query_pos = cross_pos_scale * self.query_pos(query_sine_embed)
 
-        tgt2 = self.cross_attn(tgt, cross_query_pos, ref_pos, bev_feat)
-        tgt2 = self.norm_layers[1](tgt + self.dropout_layers[1](tgt2))
+        tgt2 = self.cross_attn(tgt, cross_query_pos, ref_pos, bev_feat, value_only=final_layer)
+        tgt2 = self.norm_layers[1](tgt2 if final_layer else tgt + self.dropout_layers[1](tgt2))
         
         output = self.norm_layers[2](self.ffn(tgt2))
         return output
@@ -241,9 +244,9 @@ class BDA_ENC(BEVDeformableAggregation):
         query_sine_embed = gen_sineembed_for_position(ref_pos, hidden_dim=self.D, temperature=10000)
         pos_q = self.query_pos(query_sine_embed)
 
-        for _, layer in enumerate(self.bda_layers):
+        for lid, layer in enumerate(self.bda_layers):
             query_pos = self.pos_scale(output) * pos_q
-            output = layer(output, query_pos, ref_pos_norm, bev_feat)
+            output = layer(output, query_pos, ref_pos_norm, bev_feat, lid == len(self.bda_layers) - 1)
             
         return output, ref_pos
 
@@ -288,6 +291,9 @@ class BDA_DEC(BEVDeformableAggregation):
         )
 
         for lid, layer in enumerate(self.bda_layers):
-            output = layer(output, query_sine_embed, ref_pos_norm, bev_feat, lid)
+            output = layer(
+                output, query_sine_embed, ref_pos_norm, bev_feat, lid,
+                lid == len(self.bda_layers) - 1
+            )
             
         return output, ref_pos_target

@@ -49,30 +49,35 @@ class BEVTraj(BaseModel):
     def forward(self, batch):
         traj_data = batch['traj_data']['input_dict']
         sensor_data = batch['sensor_data']
-        tc_dynamics, ego_dynamics, agent_history = self.prepare_decoder_input(traj_data)
+        ego_dynamics = self.prepare_decoder_input(traj_data)
         
         # encoding
         pre_encoder_emb = self.pre_encoder(traj_data)
         bev_feature = self.sensor_encoder.get_bev_feature(sensor_data['batch_input_dict'], sensor_data['data_samples'])
-        scene_context_feature, dense_future_pred = self.scene_context_encoder(traj_data, pre_encoder_emb, bev_feature, ego_dynamics)
+        agent_feature, dense_future_feature, dense_future_pred, dense_future_goal = self.scene_context_encoder(
+            traj_data, pre_encoder_emb, bev_feature, ego_dynamics
+        )
         
         # decoding
         bev_feature = self.bev_feat_down(bev_feature)
-        scene_context_feature = self.sc_feat_down(scene_context_feature)
-        obj_valid_mask = traj_data['obj_trajs_mask'].sum(dim=-1) > 0
+        agent_feature = self.sc_feat_down(agent_feature)
+        dense_future_feature = self.sc_feat_down(dense_future_feature)
+        agent_valid_mask = traj_data['obj_trajs_mask'].any(dim=-1)
+        dense_obj_valid_mask = agent_valid_mask[:, :dense_future_pred.size(1)]
         output = self.decoder(
-            scene_context_feature,
+            agent_feature,
+            dense_future_feature,
             bev_feature,
-            tc_dynamics,
             ego_dynamics,
             dense_future_pred=dense_future_pred,
-            obj_valid_mask=obj_valid_mask,
+            agent_valid_mask=agent_valid_mask,
+            dense_obj_valid_mask=dense_obj_valid_mask,
             target_idx=traj_data['track_index_to_predict'],
-            agent_history=agent_history,
         )
         
         # get loss
         output['dense_future_pred'] = dense_future_pred
+        output['dense_future_goal'] = dense_future_goal
         loss = self.get_loss(traj_data, output)
         
         last_logit = output['predicted_probability'][-1]
@@ -92,6 +97,7 @@ class BEVTraj(BaseModel):
                       'initial_predicted_trajectory': initial_traj,
                       'predicted_trajectory': last_traj,
                       'dense_future_pred': dense_future_pred,
+                      'dense_future_goal': dense_future_goal,
                       'goal_position': goal_position}
         
         return prediction, loss
@@ -113,12 +119,7 @@ class BEVTraj(BaseModel):
     def prepare_decoder_input(self, traj_data):
         agents_in = traj_data['obj_trajs'] # (B, N, t, _)
         B_idx = torch.arange(agents_in.size(0), device=agents_in.device)
-        target_idx = traj_data['track_index_to_predict']
         ego_idx = traj_data['ego_index']
-        
-        # (target_agent-centric) target agent dynamics
-        tc_indices = [0, 1, -4, -3, -2, -1, 3, 4, 5]
-        target_agent_dynamics = agents_in[B_idx, target_idx, ...][..., tc_indices] # (B, t, 9)
         
         # ego-vehicle dynamics
         ego_dynamics = {
@@ -128,17 +129,7 @@ class BEVTraj(BaseModel):
             'ego_cos': agents_in[B_idx, ego_idx, -1, -5:-4], # (B, 1)
         }
 
-        # Agent positions are already expressed in the target-agent frame.
-        agent_history = {
-            'positions': traj_data['obj_trajs_pos'][..., :2],  # (B, N, t, 2)
-            'valid_mask': traj_data['obj_trajs_mask'].bool(),  # (B, N, t)
-        }
-        
-        return (
-            target_agent_dynamics,
-            ego_dynamics,
-            agent_history,
-        )
+        return ego_dynamics
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), **self.optimizer_cfg)

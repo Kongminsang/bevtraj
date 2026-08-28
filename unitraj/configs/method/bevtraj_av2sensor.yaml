@@ -162,13 +162,14 @@ MODEL:
     SCENE_CONTEXT_ENCODER:
         future_len: *future_len
         d_model: 256
-        pointnet_hidden_dim: 256
-        pointnet_num_layer: 3
-        use_local_attn: true
-        num_of_attn_neighbors: 7
-        num_attn_layers: 2
         num_attn_head: 8
         dropout_of_attn: 0.1
+        num_dense_objects: 8
+        dense_goal_temperature: 0.1
+        dense_trajectory_file_name: 'trajectory_set_64_60.pkl'
+        dense_refinement_smoothing_kernel_size: 7
+        dense_refinement_smoothing_sigma: 2.5
+        dt: 0.1
 
         bda_enc:
             num_ba_query: 64
@@ -184,6 +185,13 @@ MODEL:
                 deform_attn:
                     num_heads: 8
                     num_key_points: 6
+
+        dense_deform_cross_attn:
+            dim_head: 64
+            num_heads: 8
+            num_sampling_points: 6
+            dropout: 0.1
+            grid_size: *grid_size
 
     DECODER:
         past_len: *past_len
@@ -202,16 +210,9 @@ MODEL:
         spa_pos_T: 10000
 
         dropout: 0.1
-        num_goal_proposal_layers: 2
-        goal_score_hidden_dim: 64
-        goal_agent_distance_threshold: 5.0
-        bev_path_softmin_temperature: 0.25
-        goal_path_time_stride: 5
         goal_attn_temperature: 0.25
         num_decoder_layers: 4
         num_heads: 16
-        score_time_stride_late_layers: 1
-        score_time_full_refine_layers: 1
         refinement_smoothing_kernel_size: 7
         refinement_smoothing_sigma: 2.5
         goal_anchor_file_name: 'cluster_10mode_96anchors_detailed_6s.pkl'
@@ -264,6 +265,7 @@ MODEL:
         smoothness_dt: 0.1
         state_query_weight: 0.25
         dense_future_weight: 0.5
+        dense_goal_weight: 1.0
         refinement_smoothing_sigma: 2.5
         refinement_smoothing_weight: 0.3
         # EDA
