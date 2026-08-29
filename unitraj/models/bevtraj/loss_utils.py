@@ -290,10 +290,10 @@ class Criterion(nn.Module):
         num_center_objects, num_objects, num_timestamps, _ = pred_dense_trajs.shape
         total_objects = num_center_objects * num_objects
         fake_scores = pred_dense_trajs.new_zeros(total_objects, 1)
-        temp_pred_trajs = pred_dense_trajs_gmm.contiguous().view(total_objects, 1, num_timestamps, 5)
-        temp_gt_idx = torch.zeros(total_objects).long()
-        temp_gt_trajs = obj_trajs_future_state[:, :, :, 0:2].contiguous().view(total_objects, num_timestamps, 2)
-        temp_gt_trajs_mask = obj_trajs_future_mask.view(total_objects, num_timestamps)
+        temp_pred_trajs = pred_dense_trajs_gmm.reshape(total_objects, 1, num_timestamps, 5)
+        temp_gt_idx = torch.zeros(total_objects, device=prediction.device, dtype=torch.long)
+        temp_gt_trajs = obj_trajs_future_state[..., :2].reshape(total_objects, num_timestamps, 2)
+        temp_gt_trajs_mask = obj_trajs_future_mask.reshape(total_objects, num_timestamps)
         loss_reg_gmm, _ = self.nll_loss_gmm_direct(
             pred_scores=fake_scores,
             pred_trajs=temp_pred_trajs,
@@ -303,7 +303,7 @@ class Criterion(nn.Module):
             timestamp_loss_weight=None,
             use_square_gmm=False,
         )
-        loss_reg_gmm = loss_reg_gmm.view(num_center_objects, num_objects)
+        loss_reg_gmm = loss_reg_gmm.reshape(num_center_objects, num_objects)
 
         loss_reg = loss_reg_vel + loss_reg_gmm
 
