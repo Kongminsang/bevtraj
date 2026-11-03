@@ -1,0 +1,14 @@
+# exp setting
+ckpt_path: null # checkpoint path, used for evaluation
+save_checkpoint: True # whether to save training checkpoints
+seed: 42 # random seed
+devices: [ 0, 1, 2, 3 ] # gpu ids
+eval: False
+
+# official evaluation
+nuscenes_dataroot: 'data/nuscenes'
+eval_nuscenes: False # whether to evaluate with nuscenes evaluation tool
+eval_waymo: False # whether to evaluate with waymo evaluation tool
+
+defaults:
+  - method: bevtraj_nusc

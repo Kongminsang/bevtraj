@@ -1,0 +1,591 @@
+# experiment_name (for wandb)
+
+exp_name: &exp_name 'bevtraj_nusc'
+
+# train
+
+max_epochs: &max_epochs 10
+train_batch_size: &train_batch_size 8
+eval_batch_size: &eval_batch_size 16
+grad_clip_norm: 5
+visualize_num: &visualize_num 40
+
+# model settings
+
+dataset_name: &dataset_name 'nusc'
+model_name: &model_name 'BEVTraj'
+past_len: &past_len 21
+future_len: &future_len 60
+
+point_cloud_range: &point_cloud_range [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+map_class_names: &map_class_names
+    - drivable_area
+    - ped_crossing
+    - walkway
+    - stop_line
+    - carpark_area
+    - divider
+
+# model
+
+MODEL:
+    NAME: *model_name
+    exp_name: *exp_name
+    past_len: *past_len
+    visualize_num: *visualize_num
+    grid_size: &grid_size [51.2, 51.2]
+
+    PRE_ENCODER:
+        k_attr: 8
+        d_model: 256
+        num_encoder_layers: 2
+        tx_num_heads: 16
+        tx_hidden_size: 384
+        dropout: 0.1
+        past_len: *past_len
+    
+    SENSOR_ENCODER:
+        data_preprocessor:
+            pad_size_divisor: 32
+            voxelize_cfg:
+                max_num_points: 10
+                point_cloud_range: *point_cloud_range
+                voxel_size: [0.1, 0.1, 0.2]
+                max_voxels: [90000, 120000]
+                voxelize_reduce: true
+        encoders:
+            camera:
+                backbone:
+                    embed_dims: 96
+                    depths: [2, 2, 6, 2]
+                    num_heads: [3, 6, 12, 24]
+                    window_size: 7
+                    mlp_ratio: 4
+                    qkv_bias: true
+                    qk_scale: null
+                    drop_rate: 0.0
+                    attn_drop_rate: 0.0
+                    drop_path_rate: 0.3
+                    patch_norm: true
+                    out_indices: [1, 2, 3]
+                    with_cp: false
+                    convert_weights: true
+                neck:
+                    in_channels: [192, 384, 768]
+                    out_channels: 256
+                    start_level: 0
+                    num_outs: 3
+                    norm_cfg:
+                        type: BN2d
+                        requires_grad: true
+                    act_cfg:
+                        type: ReLU
+                        inplace: true
+                    upsample_cfg:
+                        mode: bilinear
+                        align_corners: false
+                vtransform:
+                    in_channels: 256
+                    out_channels: 80
+                    image_size: [256, 704]
+                    feature_size: [32, 88]
+                    xbound: [-51.2, 51.2, 0.4]
+                    ybound: [-51.2, 51.2, 0.4]
+                    zbound: [-10.0, 10.0, 20.0]
+                    dbound: [1.0, 60.0, 0.5]
+                    downsample: 2
+            lidar:
+                backbone:
+                    in_channels: 5
+                    output_channels: 128
+                    sparse_shape: [1024, 1024, 41]
+                    order: [conv, norm, act]
+                    norm_cfg:
+                        type: BN1d
+                        eps: 0.001
+                        momentum: 0.01
+                    encoder_channels:
+                        - [16, 16, 32]
+                        - [32, 32, 64]
+                        - [64, 64, 128]
+                        - [128, 128]
+                    encoder_paddings:
+                        - [0, 0, 1]
+                        - [0, 0, 1]
+                        - [0, 0, [1, 1, 0]]
+                        - [0, 0]
+                    block_type: basicblock
+        fuser:
+            in_channels: [80, 256]
+            out_channels: 256
+        decoder:
+            backbone:
+                in_channels: 256
+                out_channels: [128, 256]
+                layer_nums: [5, 5]
+                layer_strides: [1, 2]
+                norm_cfg:
+                    type: BN
+                    eps: 0.001
+                    momentum: 0.01
+                conv_cfg:
+                    type: Conv2d
+                    bias: false
+            neck:
+                in_channels: [128, 256]
+                out_channels: [256, 256]
+                upsample_strides: [1, 2]
+                norm_cfg:
+                    type: BN
+                    eps: 0.001
+                    momentum: 0.01
+                upsample_cfg:
+                    type: deconv
+                    bias: false
+                use_conv_for_no_stride: true
+        heads:
+            map:
+                in_channels: 512
+                grid_transform:
+                    input_scope:
+                        - [-51.2, 51.2, 0.8]
+                        - [-51.2, 51.2, 0.8]
+                    output_scope:
+                        - [-50, 50, 0.5]
+                        - [-50, 50, 0.5]
+                classes: *map_class_names
+                loss_type: focal
+                use_grid_transform: true
+        dataset_name: *dataset_name
+        weight_path: pretraining_ckpt/bevfusion-seg.pth
+    
+    SCENE_CONTEXT_ENCODER:
+        future_len: *future_len
+        d_model: 256
+        pointnet_hidden_dim: 256
+        pointnet_num_layer: 3
+        use_local_attn: true
+        num_of_attn_neighbors: 7
+        num_attn_layers: 2
+        num_attn_head: 8
+        dropout_of_attn: 0.1
+
+        bda_enc:
+            num_ba_query: 64
+            dropout: 0.1
+            grid_size: *grid_size
+            use_anchor_points: true
+            anchor_file_name: 'cluster_64_center_dict_6s.pkl'
+            num_bda_layers: 3
+            bda_layer:
+                dropout: 0.1
+                num_heads: 8
+                ffn_dims: 512
+                deform_attn:
+                    num_heads: 8
+                    num_key_points: 6
+
+    DECODER:
+        past_len: *past_len
+        future_len: *future_len
+        grid_size: *grid_size
+
+        d_model: 256
+        ffn_dims: 512
+        t_dims: 64
+        T_dims: 32
+
+        num_modes: 10
+        target_attr: &target_attr 9
+        query_scale_dims: 256
+        mode_pos_T: 10000
+        spa_pos_T: 10000
+
+        dropout: 0.1
+        num_goal_proposal_layers: 2
+        goal_score_hidden_dim: 64
+        goal_agent_distance_threshold: 5.0
+        bev_path_softmin_temperature: 0.25
+        goal_path_time_stride: 5
+        goal_attn_temperature: 0.25
+        num_decoder_layers: 4
+        num_heads: 16
+        score_time_stride_late_layers: 1
+        score_time_full_refine_layers: 1
+        refinement_smoothing_kernel_size: 7
+        refinement_smoothing_sigma: 2.5
+        goal_anchor_file_name: 'cluster_10mode_96anchors_detailed_6s.pkl'
+        trajectory_file_name: 'trajectory_set_256_60.pkl'
+
+        bda_dec:
+            past_len: *past_len
+            t_dims: 64
+            num_ba_query: 256
+            dropout: 0.1
+            grid_size: *grid_size
+            num_bda_layers: 3
+            target_attr: *target_attr
+            anchor_file_name: 'cluster_256_center_dict_6s.pkl'
+            bda_layer:
+                dropout: 0.1
+                num_heads: 8
+                ffn_dims: 512
+                deform_attn:
+                    num_heads: 8
+                    num_key_points: 6
+
+        deform_cross_attn:
+            dim_head: 64
+            num_heads: 8
+            num_sampling_points: 12
+            dropout: 0.1
+            grid_size: *grid_size
+            multi_range: true
+            time_scale_range: [1.0, 2.0]
+            offset_group_scales: [0.5, 1.0, 2.0]
+        deform_cross_attn_itr:
+            dim_head: 64
+            num_heads: 8
+            num_sampling_points: 6
+            dropout: 0.1
+            grid_size: *grid_size
+
+    loss:
+        # SGCP goal and displacement loss
+        goal_position_weight: 1.0
+        disp_weight: 1.0
+        # decoder loss
+        cls_weight: 2.5
+        reg_weight: 4.0
+        vel_weight: 0.5
+        curvature_weight: 0.05
+        acc_weight: 0.001
+        jerk_weight: 0.00003
+        smoothness_dt: 0.1
+        state_query_weight: 0.25
+        dense_future_weight: 0.5
+        refinement_smoothing_sigma: 2.5
+        refinement_smoothing_weight: 0.3
+        # EDA
+        num_inter_layers: 2
+        distinct_anchors: false
+        distinct_nms_thresh: -1.0
+
+    optimizer:
+        lr: 0.0001
+        weight_decay: 0.01
+    scheduler:
+        lr: 0.0001
+        min_lr: 1e-5
+        warmup_epochs: 2
+        epochs: *max_epochs
+
+
+# traj_data
+
+load_num_workers: &load_num_workers 8
+train_data_path: &train_data_path ['data/nuscenes/prediction_converted_train']
+val_data_path: &val_data_path ['data/nuscenes/prediction_converted_val']
+max_data_num: &max_data_num [1000000]
+max_num_agents: &max_num_agents 32
+object_type: &object_type ['VEHICLE']
+masked_attributes: &masked_attributes ['z_axis']
+only_train_on_ego: &only_train_on_ego false
+target_bev_range: &target_bev_range 35.0
+target_bev_min_coverage: &target_bev_min_coverage 0.8
+use_cache: &use_cache false
+overwrite_cache: &overwrite_cache false
+store_data_in_memory: &store_data_in_memory false
+trajectory_sample_interval: &trajectory_sample_interval 1
+multisample_per_scene: &multisample_per_scene false
+#map (only for visualization)
+ego_get_map_data: &ego_get_map_data true
+map_range: &map_range 50
+max_num_roads: &max_num_roads 256
+max_points_per_lane: &max_points_per_lane 20
+manually_split_lane: &manually_split_lane false
+point_sampled_interval: &point_sampled_interval 1
+num_points_each_polyline: &num_points_each_polyline 20
+vector_break_dist_thresh: &vector_break_dist_thresh 1.0
+line_type: &line_type [ 'lane','stop_sign','road_edge','road_line','crosswalk','speed_bump', ]
+center_offset_of_map: &center_offset_of_map [ 0.0, 0.0 ]
+
+# sensor_data
+
+class_names: &class_names
+    - car
+    - truck
+    - construction_vehicle
+    - bus
+    - trailer
+    - barrier
+    - motorcycle
+    - bicycle
+    - pedestrian
+    - traffic_cone
+
+meta_info: &meta_info
+    classes: *class_names
+dataset_type: &dataset_type 'CombinedNuScenes'
+data_root: &data_root 'data/nuscenes'
+data_prefix: &data_prefix
+    pts: 'samples/LIDAR_TOP'
+    CAM_FRONT: 'samples/CAM_FRONT'
+    CAM_FRONT_LEFT: 'samples/CAM_FRONT_LEFT'
+    CAM_FRONT_RIGHT: 'samples/CAM_FRONT_RIGHT'
+    CAM_BACK: 'samples/CAM_BACK'
+    CAM_BACK_RIGHT: 'samples/CAM_BACK_RIGHT'
+    CAM_BACK_LEFT: 'samples/CAM_BACK_LEFT'
+    sweeps: 'sweeps/LIDAR_TOP'
+input_modality: &input_modality    
+    use_lidar: true 
+    use_camera: true
+backend_args: &backend_args null
+
+train_pipeline: &train_pipeline
+
+    - type: BEVLoadMultiViewImageFromFiles
+      to_float32: true
+      color_type: color
+
+    - type: LoadPointsFromFile
+      coord_type: LIDAR
+      load_dim: 5
+      use_dim: 5
+      reduce_beams: 32
+
+    - type: LoadPointsFromMultiSweeps
+      sweeps_num: 9
+      load_dim: 5
+      use_dim: 5
+      pad_empty_sweeps: true
+      remove_close: true
+      reduce_beams: 32
+
+    - type : ImageAug3D
+      final_dim: [256, 704]
+      resize_lim: [0.38, 0.55]
+      bot_pct_lim: [0.0, 0.0]
+      rot_lim: [-5.4, 5.4]
+      rand_flip: true
+      is_train: true
+
+    - type: MIT_GlobalRotScaleTrans
+      resize_lim: [1.0, 1.0]
+      rot_lim: [0.0, 0.0]
+      trans_lim: 0.0
+      is_train: false
+
+    # - type: LoadBEVSegmentation
+    #   dataset_name: *dataset_name
+    #   dataset_root: *data_root
+    #   xbound: [-50.0, 50.0, 0.5]
+    #   ybound: [-50.0, 50.0, 0.5]
+    #   classes: *map_class_names
+
+    - type: PointsRangeFilter
+      point_cloud_range: *point_cloud_range
+
+    - type: ImageNormalize
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+    - type: PointShuffle
+
+    - type: Pack3DDetInputs
+      keys:
+          - points
+          - img
+          - gt_bboxes_3d
+          - gt_labels_3d
+          - gt_bboxes
+          - gt_labels
+          - gt_masks_bev
+      meta_keys:
+          - cam2img
+          - ori_cam2img
+          - lidar2cam
+          - lidar2img
+          - cam2lidar
+          - ori_lidar2img
+          - img_aug_matrix
+          - box_type_3d
+          - sample_idx
+          - lidar_path
+          - img_path
+          - transformation_3d_flow
+          - pcd_rotation
+          - pcd_scale_factor
+          - pcd_trans
+          - img_aug_matrix
+          - lidar_aug_matrix
+          - cam2global
+          - lidar2ego
+          - ego2global
+
+test_pipeline: &test_pipeline
+
+    - type: BEVLoadMultiViewImageFromFiles
+      to_float32: true
+      color_type: color
+
+    - type: LoadPointsFromFile
+      coord_type: LIDAR
+      load_dim: 5
+      use_dim: 5
+      reduce_beams: 32
+
+    - type: LoadPointsFromMultiSweeps
+      sweeps_num: 9
+      test_mode: true
+      load_dim: 5
+      use_dim: 5
+      reduce_beams: 32
+      pad_empty_sweeps: true
+      remove_close: true
+
+    - type : ImageAug3D
+      final_dim: [256, 704]
+      resize_lim: [0.48, 0.48]
+      bot_pct_lim: [0.0, 0.0]
+      rot_lim: [0.0, 0.0]
+      rand_flip: false
+      is_train: false
+
+    - type: MIT_GlobalRotScaleTrans
+      resize_lim: [1.0, 1.0]
+      rot_lim: [0.0, 0.0]
+      trans_lim: 0.0
+      is_train: false
+
+    # - type: LoadBEVSegmentation
+    #   dataset_name: *dataset_name
+    #   dataset_root: *data_root
+    #   xbound: [-50.0, 50.0, 0.5]
+    #   ybound: [-50.0, 50.0, 0.5]
+    #   classes: *map_class_names
+
+    - type: PointsRangeFilter
+      point_cloud_range: *point_cloud_range
+
+    - type: ImageNormalize
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+      
+    - type: Pack3DDetInputs
+      keys:
+          - img
+          - points
+          - gt_bboxes_3d
+          - gt_labels_3d
+          - gt_masks_bev
+      meta_keys:
+          - cam2img
+          - ori_cam2img
+          - lidar2cam
+          - lidar2img
+          - cam2lidar
+          - ori_lidar2img
+          - img_aug_matrix
+          - box_type_3d
+          - sample_idx
+          - lidar_path
+          - img_path
+          - num_pts_feats
+          - num_views
+          - lidar_aug_matrix
+          - cam2global
+          - lidar2ego
+          - ego2global
+
+# dataset
+
+TRAIN_DATASET:
+    dataset_type: *dataset_type
+    token2idx_dict_path: "data/nuscenes/sample_token2idx_train.pkl"
+    TRAJ_DATASET:
+        model_name: *model_name
+        load_num_workers: *load_num_workers
+        data_path: *train_data_path
+        max_data_num: *max_data_num
+        past_len: *past_len
+        future_len: *future_len
+        max_num_agents: *max_num_agents
+        object_type: *object_type
+        masked_attributes: *masked_attributes
+        only_train_on_ego: *only_train_on_ego
+        target_bev_range: *target_bev_range
+        target_bev_min_coverage: *target_bev_min_coverage
+        use_cache: *use_cache 
+        overwrite_cache: *overwrite_cache 
+        store_data_in_memory: *store_data_in_memory
+        trajectory_sample_interval: *trajectory_sample_interval
+        multisample_per_scene: *multisample_per_scene
+        # map
+        ego_get_map_data: *ego_get_map_data
+        map_range: *map_range 
+        max_num_roads: *max_num_roads 
+        max_points_per_lane: *max_points_per_lane 
+        manually_split_lane: *manually_split_lane 
+        point_sampled_interval: *point_sampled_interval 
+        num_points_each_polyline: *num_points_each_polyline 
+        vector_break_dist_thresh: *vector_break_dist_thresh
+        line_type: *line_type
+        center_offset_of_map: *center_offset_of_map
+
+    SENSOR_DATASET:
+        data_root: *data_root
+        ann_file: 'BEVTraj_infos_train.pkl'
+        pipeline: *train_pipeline
+        metainfo: *meta_info
+        modality: *input_modality
+        data_prefix: *data_prefix
+        test_mode: false
+        use_valid_flag: true
+        box_type_3d: 'LiDAR'
+        filter_empty_gt: false
+
+VAL_DATASET:
+    dataset_type: *dataset_type
+    token2idx_dict_path: "data/nuscenes/sample_token2idx_val.pkl"
+    TRAJ_DATASET:
+        model_name: *model_name
+        load_num_workers: *load_num_workers
+        data_path: *val_data_path
+        max_data_num: *max_data_num
+        past_len: *past_len
+        future_len: *future_len
+        max_num_agents: *max_num_agents
+        object_type: *object_type
+        masked_attributes: *masked_attributes
+        only_train_on_ego: *only_train_on_ego
+        target_bev_range: *target_bev_range
+        target_bev_min_coverage: *target_bev_min_coverage
+        use_cache: *use_cache
+        overwrite_cache: *overwrite_cache
+        store_data_in_memory: *store_data_in_memory
+        trajectory_sample_interval: *trajectory_sample_interval
+        multisample_per_scene: *multisample_per_scene
+        # map
+        ego_get_map_data: *ego_get_map_data
+        map_range: *map_range 
+        max_num_roads: *max_num_roads 
+        max_points_per_lane: *max_points_per_lane 
+        manually_split_lane: *manually_split_lane 
+        point_sampled_interval: *point_sampled_interval 
+        num_points_each_polyline: *num_points_each_polyline 
+        vector_break_dist_thresh: *vector_break_dist_thresh
+        line_type: *line_type
+        center_offset_of_map: *center_offset_of_map
+
+    SENSOR_DATASET:
+        data_root: *data_root
+        ann_file: 'BEVTraj_infos_val.pkl' 
+        pipeline: *test_pipeline
+        metainfo: *meta_info
+        modality: *input_modality
+        data_prefix: *data_prefix
+        test_mode: true
+        box_type_3d: 'LiDAR'
+        backend_args: *backend_args
+        filter_empty_gt: false
